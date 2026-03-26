@@ -362,69 +362,78 @@ class GradientGuidedStrategy(BaseFusionStrategy):
 @FusionStrategyRegistry.register('hybrid')
 class HybridFusionStrategy(BaseFusionStrategy):
     """
-    混合融合策略（性能优化版）
+    混合融合策略
     
-    优化点：
+    特点：
     -----
-    1. 合并EnhancedL1和MultiScale的计算
-    2. 复用梯度计算结果
-    3. 简化权重混合逻辑
-    4. 使用向量化操作代替循环
+    结合多种策略的优势：
+    - 使用增强L1作为主要融合方法
+    - 结合多尺度策略
+    - 梯度信息辅助决策
     
-    性能：3-6倍提升
+    优势：
+    -----
+    - 综合多种策略的优点
+    - 适应性强
+    - 融合效果稳健
+    
+    使用示例：
+    ---------
+    ```python
+    strategy = HybridFusionStrategy()
+    fused = strategy.fuse(ir_features, vi_features)
+    ```
     """
     
     def __init__(self):
         """初始化混合融合策略"""
         super().__init__()
         self.name = "hybrid"
-        self.description = "混合融合策略（优化版）"
-        
-        # 使用优化版本的子策略
+        self.description = "混合融合策略"
         self.enhanced_l1 = EnhancedL1Strategy()
         self.multi_scale = MultiScaleStrategy(scales=[1, 2])
     
     def fuse(self, feature1: torch.Tensor, feature2: torch.Tensor) -> torch.Tensor:
         """
-        执行混合融合（优化版）
+        执行混合融合
         
-        优化：
-        - 复用梯度计算结果
-        - 简化权重混合
-        - 减少中间张量创建
+        Args:
+            feature1: 第一个特征张量
+            feature2: 第二个特征张量
+        
+        Returns:
+            torch.Tensor: 融合后的特征
         """
-        # ========== 一次计算，多处复用 ==========
-        
-        # 1. 梯度计算（复用）
-        grad1 = self._compute_gradient_fast(feature1)
-        grad2 = self._compute_gradient_fast(feature2)
-        grad_diff = torch.abs(grad1 - grad2)
-        
-        # 2. EnhancedL1融合结果
+        # 获取各策略的融合结果
         fused_enhanced = self.enhanced_l1.fuse(feature1, feature2)
-        
-        # 3. MultiScale融合结果（优化：只用一个尺度）
         fused_multi = self.multi_scale.fuse(feature1, feature2)
         
-        # ========== 简化权重计算 ==========
-        # 使用sigmoid和梯度差异计算权重
-        weight_multi = torch.sigmoid(grad_diff - 1.0)
-        weight_enhanced = 1.0 - weight_multi
+        # 计算梯度差异
+        grad1 = self._compute_gradient(feature1)
+        grad2 = self._compute_gradient(feature2)
+        grad_diff = torch.abs(grad1 - grad2)
         
-        # ========== 混合融合 ==========
-        fused_features = weight_enhanced * fused_enhanced + weight_multi * fused_multi
+        # 根据梯度差异调整权重
+        # 梯度差异大的区域更依赖多尺度
+        weight_multi = torch.sigmoid(grad_diff - 1.0)
+        
+        # 混合
+        fused_features = (
+            (1 - weight_multi) * fused_enhanced + 
+            weight_multi * fused_multi
+        )
         
         return fused_features
     
-    def _compute_gradient_fast(self, x: torch.Tensor) -> torch.Tensor:
-        """快速梯度计算"""
-        grad_x = x[:, :, :, 1:] - x[:, :, :, :-1]
-        grad_y = x[:, :, 1:, :] - x[:, :, :-1, :]
+    def _compute_gradient(self, x: torch.Tensor) -> torch.Tensor:
+        """计算梯度幅值"""
+        grad_x = torch.abs(x[:, :, :, 1:] - x[:, :, :, :-1])
+        grad_y = torch.abs(x[:, :, 1:, :] - x[:, :, :-1, :])
         
         grad_x = F.pad(grad_x, (0, 1, 0, 0))
         grad_y = F.pad(grad_y, (0, 0, 0, 1))
         
-        grad = F.relu(grad_x) + F.relu(-grad_x) + F.relu(grad_y) + F.relu(-grad_y)
+        grad = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-6)
         
         return grad
     
@@ -436,7 +445,5 @@ class HybridFusionStrategy(BaseFusionStrategy):
             'components': {
                 'enhanced_l1': self.enhanced_l1.get_config(),
                 'multi_scale': self.multi_scale.get_config()
-            },
-            'optimized': True,
-            'performance_gain': '3-6x'
-        }
+            }
+}
