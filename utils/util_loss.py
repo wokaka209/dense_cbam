@@ -133,3 +133,325 @@ class MSSSIM(torch.nn.Module):
     def forward(self, img1, img2):
         # TODO: store window between calls if possible
         return msssim(img1, img2, window_size=self.window_size, size_average=self.size_average)
+
+
+class GradientLoss(torch.nn.Module):
+    """梯度损失函数 - 基于Sobel算子计算图像边缘信息，用于提升MI指标"""
+    
+    def __init__(self):
+        super(GradientLoss, self).__init__()
+        
+        # Sobel算子 - X方向梯度
+        self.sobel_x = torch.tensor([
+            [-1, 0, 1],
+            [-2, 0, 2],
+            [-1, 0, 1]
+        ], dtype=torch.float32).view(1, 1, 3, 3)
+        
+        # Sobel算子 - Y方向梯度
+        self.sobel_y = torch.tensor([
+            [-1, -2, -1],
+            [0, 0, 0],
+            [1, 2, 1]
+        ], dtype=torch.float32).view(1, 1, 3, 3)
+    
+    def forward(self, pred, target):
+        """
+        计算预测图像和目标图像之间的梯度差异损失
+        
+        Args:
+            pred: 预测图像 [B, C, H, W]
+            target: 目标图像 [B, C, H, W]
+        
+        Returns:
+            gradient_loss: 梯度损失值
+        """
+        # 获取设备和通道数
+        device = pred.device
+        num_channels = pred.size(1)
+        
+        # 将Sobel算子移动到相同设备，并扩展到与通道数匹配
+        # 使用 depthwise convolution：每个通道使用相同的 Sobel 核
+        sobel_x = self.sobel_x.to(device).expand(num_channels, 1, 3, 3)
+        sobel_y = self.sobel_y.to(device).expand(num_channels, 1, 3, 3)
+        
+        # 计算预测图像的梯度 - depthwise convolution
+        pred_grad_x = F.conv2d(pred, sobel_x, padding=1, groups=num_channels)
+        pred_grad_y = F.conv2d(pred, sobel_y, padding=1, groups=num_channels)
+        pred_grad = torch.sqrt(pred_grad_x ** 2 + pred_grad_y ** 2 + 1e-6)
+        
+        # 计算目标图像的梯度
+        target_grad_x = F.conv2d(target, sobel_x, padding=1, groups=num_channels)
+        target_grad_y = F.conv2d(target, sobel_y, padding=1, groups=num_channels)
+        target_grad = torch.sqrt(target_grad_x ** 2 + target_grad_y ** 2 + 1e-6)
+        
+        # 计算L1损失
+        loss = F.l1_loss(pred_grad, target_grad)
+        
+        return loss
+
+
+class MultiScaleGradientLoss(torch.nn.Module):
+    """多尺度梯度损失函数 - 在多个尺度上计算梯度差异"""
+    
+    def __init__(self, scales=[1, 2, 4]):
+        super(MultiScaleGradientLoss, self).__init__()
+        self.scales = scales
+        self.gradient_loss = GradientLoss()
+    
+    def forward(self, pred, target):
+        """
+        计算多尺度梯度损失
+        
+        Args:
+            pred: 预测图像 [B, C, H, W]
+            target: 目标图像 [B, C, H, W]
+        
+        Returns:
+            multi_scale_loss: 多尺度梯度损失
+        """
+        total_loss = 0.0
+        weight_sum = 0.0
+        
+        for scale in self.scales:
+            if scale == 1:
+                pred_scaled = pred
+                target_scaled = target
+            else:
+                pred_scaled = F.avg_pool2d(pred, kernel_size=scale, stride=scale)
+                target_scaled = F.avg_pool2d(target, kernel_size=scale, stride=scale)
+            
+            # 计算该尺度下的梯度损失
+            scale_loss = self.gradient_loss(pred_scaled, target_scaled)
+            total_loss += scale_loss
+            weight_sum += 1.0
+        
+        return total_loss / weight_sum
+
+
+def gradient_loss(pred, target):
+    """
+    函数式接口的梯度损失计算
+    
+    用于直接集成到现有的训练流程中
+    
+    Args:
+        pred: 预测图像
+        target: 目标图像
+    
+    Returns:
+        gradient_loss_value: 梯度损失值
+    """
+    device = pred.device
+    num_channels = pred.size(1)
+    
+    # Sobel算子 - 对每个通道使用相同的卷积核
+    sobel_x = torch.tensor([
+        [-1, 0, 1],
+        [-2, 0, 2],
+        [-1, 0, 1]
+    ], dtype=torch.float32).view(1, 1, 3, 3).to(device)
+    
+    sobel_y = torch.tensor([
+        [-1, -2, -1],
+        [0, 0, 0],
+        [1, 2, 1]
+    ], dtype=torch.float32).view(1, 1, 3, 3).to(device)
+    
+    # 使用深度可分离卷积：groups=num_channels
+    # 每个通道使用相同的 Sobel 核，但分别计算
+    sobel_x_expanded = sobel_x.expand(num_channels, 1, 3, 3)
+    sobel_y_expanded = sobel_y.expand(num_channels, 1, 3, 3)
+    
+    # 计算梯度 - depthwise convolution
+    pred_grad_x = F.conv2d(pred, sobel_x_expanded, padding=1, groups=num_channels)
+    pred_grad_y = F.conv2d(pred, sobel_y_expanded, padding=1, groups=num_channels)
+    pred_grad = torch.sqrt(pred_grad_x ** 2 + pred_grad_y ** 2 + 1e-6)
+    
+    target_grad_x = F.conv2d(target, sobel_x_expanded, padding=1, groups=num_channels)
+    target_grad_y = F.conv2d(target, sobel_y_expanded, padding=1, groups=num_channels)
+    target_grad = torch.sqrt(target_grad_x ** 2 + target_grad_y ** 2 + 1e-6)
+    
+    # L1损失
+    return F.l1_loss(pred_grad, target_grad)
+
+
+def multi_scale_gradient_loss(pred, target, scales=[1, 2, 4]):
+    """
+    函数式接口的多尺度梯度损失计算
+    
+    Args:
+        pred: 预测图像
+        target: 目标图像
+        scales: 尺度列表
+    
+    Returns:
+        multi_scale_loss_value: 多尺度梯度损失值
+    """
+    total_loss = 0.0
+    
+    for scale in scales:
+        if scale == 1:
+            pred_scaled = pred
+            target_scaled = target
+        else:
+            pred_scaled = F.avg_pool2d(pred, kernel_size=scale, stride=scale)
+            target_scaled = F.avg_pool2d(target, kernel_size=scale, stride=scale)
+        
+        total_loss += gradient_loss(pred_scaled, target_scaled)
+    
+    return total_loss / len(scales)
+
+
+class TVLoss(torch.nn.Module):
+    """Total Variation (TV) 损失函数 - 用于保持图像平滑性，减少噪声同时保留边缘"""
+    
+    def __init__(self):
+        super(TVLoss, self).__init__()
+    
+    def forward(self, x):
+        """
+        计算Total Variation损失
+        
+        TVLoss = Σ|x(i+1,j) - x(i,j)| + |x(i,j+1) - x(i,j)|
+        
+        Args:
+            x: 输入图像张量 [B, C, H, W]
+        
+        Returns:
+            tv_loss: TV损失值
+        """
+        batch_size, channels, height, width = x.size()
+        
+        # 计算水平方向的差异 (与右侧像素)
+        diff_x = torch.abs(x[:, :, 1:, :] - x[:, :, :-1, :])
+        
+        # 计算垂直方向的差异 (与下方像素)
+        diff_y = torch.abs(x[:, :, :, 1:] - x[:, :, :, :-1])
+        
+        # 求和并平均
+        tv_loss = (diff_x.sum() + diff_y.sum()) / (batch_size * channels)
+        
+        return tv_loss
+
+
+def tv_loss(x):
+    """
+    函数式接口的TV损失计算
+    
+    Args:
+        x: 输入图像张量 [B, C, H, W]
+    
+    Returns:
+        tv_loss_value: TV损失值
+    """
+    batch_size, channels, height, width = x.size()
+    
+    # 计算水平方向的差异
+    diff_x = torch.abs(x[:, :, 1:, :] - x[:, :, :-1, :])
+    
+    # 计算垂直方向的差异
+    diff_y = torch.abs(x[:, :, :, 1:] - x[:, :, :, :-1])
+    
+    # 求和并平均
+    tv_loss_value = (diff_x.sum() + diff_y.sum()) / (batch_size * channels)
+    
+    return tv_loss_value
+
+
+class CombinedLoss(torch.nn.Module):
+    """
+    组合损失函数 - L1损失 + SSIM损失 + 梯度损失 + TV损失的加权组合
+    
+    总损失 = λ1 * L1_loss + λ2 * (1 - SSIM) + λ3 * Gradient_loss + λ4 * TV_loss
+    
+    Attributes:
+        l1_weight (float): L1损失权重 (默认: 1.0)
+        ssim_weight (float): SSIM损失权重 (默认: 1.0)
+        grad_weight (float): 梯度损失权重 (默认: 1.0)
+        tv_weight (float): TV损失权重 (默认: 0.3)
+        ssim_loss_fn: SSIM损失函数
+        grad_loss_fn: 梯度损失函数
+        tv_loss_fn: TV损失函数
+    """
+    
+    def __init__(self, l1_weight=1.0, ssim_weight=1.0, grad_weight=1.0, tv_weight=0.3):
+        super(CombinedLoss, self).__init__()
+        
+        self.l1_weight = l1_weight
+        self.ssim_weight = ssim_weight
+        self.grad_weight = grad_weight
+        self.tv_weight = tv_weight
+        
+        # L1损失
+        self.l1_loss = torch.nn.L1Loss()
+        
+        # SSIM损失
+        self.ssim_loss_fn = msssim
+        
+        # 梯度损失
+        self.grad_loss_fn = GradientLoss()
+        
+        # TV损失
+        self.tv_loss_fn = TVLoss()
+    
+    def forward(self, pred, target):
+        """
+        计算组合损失
+        
+        Args:
+            pred: 预测图像 [B, C, H, W]
+            target: 目标图像 [B, C, H, W]
+        
+        Returns:
+            total_loss: 总损失值
+            loss_dict: 包含各损失分量的字典
+        """
+        # L1损失
+        l1_loss_value = self.l1_loss(pred, target)
+        
+        # SSIM损失 (1 - SSIM)
+        ssim_loss_value = 1 - self.ssim_loss_fn(pred, target, normalize=True)
+        
+        # 梯度损失
+        grad_loss_value = self.grad_loss_fn(pred, target)
+        
+        # TV损失
+        tv_loss_value = self.tv_loss_fn(pred)
+        
+        # 加权组合
+        total_loss = (
+            self.l1_weight * l1_loss_value +
+            self.ssim_weight * ssim_loss_value +
+            self.grad_weight * grad_loss_value +
+            self.tv_weight * tv_loss_value
+        )
+        
+        loss_dict = {
+            'l1_loss': l1_loss_value.item(),
+            'ssim_loss': ssim_loss_value.item(),
+            'grad_loss': grad_loss_value.item(),
+            'tv_loss': tv_loss_value.item(),
+            'total_loss': total_loss.item()
+        }
+        
+        return total_loss, loss_dict
+    
+    def update_weights(self, l1_weight=None, ssim_weight=None, grad_weight=None, tv_weight=None):
+        """
+        动态更新损失权重
+        
+        Args:
+            l1_weight: L1损失权重
+            ssim_weight: SSIM损失权重
+            grad_weight: 梯度损失权重
+            tv_weight: TV损失权重
+        """
+        if l1_weight is not None:
+            self.l1_weight = l1_weight
+        if ssim_weight is not None:
+            self.ssim_weight = ssim_weight
+        if grad_weight is not None:
+            self.grad_weight = grad_weight
+        if tv_weight is not None:
+            self.tv_weight = tv_weight
