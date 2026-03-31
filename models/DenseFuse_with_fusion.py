@@ -90,9 +90,10 @@ class DenseFuseWithFusion(nn.Module):
             torch.Tensor: 融合后的图像
         """
         # 提取红外图像特征
+        # 使用共享权重的编码器分别提取红外和可见光图像特征
+        # 同一编码器实例处理不同输入是PyTorch的标准做法
+        # 梯度会正确累积到共享的编码器参数上
         ir_features = self.encoder(ir_image)
-        
-        # 提取可见光图像特征
         vi_features = self.encoder(vi_image)
         
         # 融合特征
@@ -141,6 +142,20 @@ class DenseFuseWithFusion(nn.Module):
     def unfreeze_decoder(self):
         """解冻解码器参数"""
         for param in self.decoder.parameters():
+            param.requires_grad = True
+    
+    def freeze_encoder(self):
+        """冻结编码器参数（conv + DenseBlock，不包括CBAM）"""
+        for param in self.encoder.conv.parameters():
+            param.requires_grad = False
+        for param in self.encoder.DenseBlock.parameters():
+            param.requires_grad = False
+
+    def unfreeze_encoder(self):
+        """解冻编码器参数"""
+        for param in self.encoder.conv.parameters():
+            param.requires_grad = True
+        for param in self.encoder.DenseBlock.parameters():
             param.requires_grad = True
     
     def freeze_fusion_layer(self):

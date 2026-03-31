@@ -72,7 +72,7 @@ class ConfigLoader:
             with open(file_path, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except json.JSONDecodeError as e:
-            raise json.JSONDecodeError(f"JSON格式错误: {e}", e.doc, e.pos)
+            raise json.JSONDecodeError(f"JSON格式错误: {e}", e.doc, e.pos) from e
     
     @classmethod
     def load_train_config(cls, config_path: Optional[str] = None) -> Dict[str, Any]:
