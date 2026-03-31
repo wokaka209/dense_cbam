@@ -151,7 +151,8 @@ class Trainer:
         self.last_lr_recovery_epoch = 0
     
     def train(self, num_epochs, init_epoch=0, use_adaptive_weights=True, optimize_en_ag=False,
-              use_balanced_loss=True, use_lr_decay=True, use_mixed_precision=False):
+              use_balanced_loss=True, use_lr_decay=True, use_mixed_precision=False,
+              l1_weight=None, ssim_weight=None, grad_weight=None, tv_weight=None):
         """
         执行训练流程
         
@@ -163,6 +164,10 @@ class Trainer:
             use_balanced_loss (bool): 是否使用平衡损失
             use_lr_decay (bool): 是否使用学习率衰减
             use_mixed_precision (bool): 是否使用混合精度训练
+            l1_weight (float, optional): 手动设置的L1损失权值
+            ssim_weight (float, optional): 手动设置的SSIM损失权值
+            grad_weight (float, optional): 手动设置的梯度损失权值
+            tv_weight (float, optional): 手动设置的TV损失权值
         
         Returns:
             dict: 训练结果统计
@@ -201,7 +206,18 @@ class Trainer:
         best_loss = float('inf')
         
         # 获取测试图像
-        test_image = next(iter(self.train_loader)).to(self.device)
+        test_batch = next(iter(self.train_loader))
+        
+        # 处理单输入和双输入模型
+        if isinstance(test_batch, (list, tuple)) and len(test_batch) == 2:
+            # 双输入模型（阶段三：红外+可见光）
+            self.test_ir_image, self.test_vi_image = test_batch
+            self.test_ir_image = self.test_ir_image.to(self.device)
+            self.test_vi_image = self.test_vi_image.to(self.device)
+            test_image = self.test_vi_image  # 使用可见光图像作为测试图像
+        else:
+            # 单输入模型（阶段一、二：仅可见光）
+            test_image = test_batch.to(self.device)
         
         for epoch in range(init_epoch, num_epochs):
             # ==================== 学习率调度 ====================
@@ -220,13 +236,21 @@ class Trainer:
                 print(f"\n学习率衰减至: {current_lr:.6f} (Epoch {epoch + 1})")
             
             # 获取损失权重
-            l1_weight, ssim_weight, grad_weight, tv_weight = get_adaptive_loss_weights(
-                epoch=epoch,
-                total_epochs=num_epochs,
-                use_balanced_loss=use_balanced_loss,
-                use_adaptive_weights=use_adaptive_weights,
-                optimize_en_ag=optimize_en_ag
-            )
+            if l1_weight is not None and ssim_weight is not None and grad_weight is not None and tv_weight is not None:
+                # 使用手动设置的权重
+                current_l1_weight = l1_weight
+                current_ssim_weight = ssim_weight
+                current_grad_weight = grad_weight
+                current_tv_weight = tv_weight
+            else:
+                # 使用自适应权重
+                current_l1_weight, current_ssim_weight, current_grad_weight, current_tv_weight = get_adaptive_loss_weights(
+                    epoch=epoch,
+                    total_epochs=num_epochs,
+                    use_balanced_loss=use_balanced_loss,
+                    use_adaptive_weights=use_adaptive_weights,
+                    optimize_en_ag=optimize_en_ag
+                )
             
             # ==================== 训练循环 ====================
             self.model.train()
@@ -239,13 +263,26 @@ class Trainer:
             }
             
             pbar = tqdm(self.train_loader, total=len(self.train_loader))
-            for batch_idx, image_batch in enumerate(pbar, start=1):
+            for batch_idx, batch_data in enumerate(pbar, start=1):
                 self.optimizer.zero_grad()
-                inputs = image_batch.to(self.device)
-                labels = image_batch.data.clone().to(self.device)
                 
-                # 前向传播
-                outputs = self.model(inputs)
+                # 处理单输入和双输入模型
+                if isinstance(batch_data, (list, tuple)) and len(batch_data) == 2:
+                    # 双输入模型（阶段三：红外+可见光）
+                    ir_inputs, vi_inputs = batch_data
+                    ir_inputs = ir_inputs.to(self.device)
+                    vi_inputs = vi_inputs.to(self.device)
+                    labels = vi_inputs.data.clone().to(self.device)  # 使用可见光图像作为重建目标
+                    
+                    # 前向传播
+                    outputs = self.model(ir_inputs, vi_inputs)
+                else:
+                    # 单输入模型（阶段一、二：仅可见光）
+                    inputs = batch_data.to(self.device)
+                    labels = inputs.data.clone().to(self.device)
+                    
+                    # 前向传播
+                    outputs = self.model(inputs)
                 
                 # 计算损失
                 pixel_loss = self.loss_fn(outputs, labels)
@@ -269,10 +306,10 @@ class Trainer:
                     tv_loss = torch.tensor(0.0)
                 
                 # 总损失
-                total_loss = (l1_weight * pixel_loss + 
-                            ssim_weight * ssim_loss + 
-                            grad_weight * grad_loss + 
-                            tv_weight * tv_loss)
+                total_loss = (current_l1_weight * pixel_loss + 
+                            current_ssim_weight * ssim_loss + 
+                            current_grad_weight * grad_loss + 
+                            current_tv_weight * tv_loss)
                 
                 # 反向传播
                 total_loss.backward()
@@ -303,10 +340,27 @@ class Trainer:
                 for key, values in train_epoch_loss.items()
             }
             
+            # 打印损失函数值
+            print(f"\nEpoch [{epoch + 1}/{num_epochs}] 损失函数值:")
+            print(f"  - L1 Loss: {avg_losses['l1_loss']:.6f}")
+            print(f"  - SSIM Loss: {avg_losses['ssim_loss']:.6f}")
+            print(f"  - Gradient Loss: {avg_losses['grad_loss']:.6f}")
+            print(f"  - TV Loss: {avg_losses['tv_loss']:.6f}")
+            print(f"  - Total Loss: {avg_losses['total_loss']:.6f}")
+            print(f"  - Learning Rate: {current_lr:.6f}")
+            
             # ==================== 验证和可视化 ====================
             with torch.no_grad():
-                rebuild_img = self.model(test_image)
-                img_grid_real = torchvision.utils.make_grid(test_image, normalize=True, nrow=4)
+                # 处理单输入和双输入模型
+                if hasattr(self, 'test_ir_image') and hasattr(self, 'test_vi_image'):
+                    # 双输入模型（阶段三：红外+可见光）
+                    rebuild_img = self.model(self.test_ir_image, self.test_vi_image)
+                    img_grid_real = torchvision.utils.make_grid(self.test_vi_image, normalize=True, nrow=4)
+                else:
+                    # 单输入模型（阶段一、二：仅可见光）
+                    rebuild_img = self.model(test_image)
+                    img_grid_real = torchvision.utils.make_grid(test_image, normalize=True, nrow=4)
+                
                 img_grid_rebuild = torchvision.utils.make_grid(rebuild_img, normalize=True, nrow=4)
                 self.writer.add_image('Real image', img_grid_real, global_step=epoch)
                 self.writer.add_image('Rebuild image', img_grid_rebuild, global_step=epoch)
@@ -315,10 +369,10 @@ class Trainer:
             for loss_name, loss_value in avg_losses.items():
                 self.writer.add_scalar(loss_name, loss_value, global_step=epoch)
             self.writer.add_scalar('learning_rate', current_lr, global_step=epoch)
-            self.writer.add_scalar('l1_weight', l1_weight, global_step=epoch)
-            self.writer.add_scalar('ssim_weight', ssim_weight, global_step=epoch)
-            self.writer.add_scalar('grad_weight', grad_weight, global_step=epoch)
-            self.writer.add_scalar('tv_weight', tv_weight, global_step=epoch)
+            self.writer.add_scalar('l1_weight', current_l1_weight, global_step=epoch)
+            self.writer.add_scalar('ssim_weight', current_ssim_weight, global_step=epoch)
+            self.writer.add_scalar('grad_weight', current_grad_weight, global_step=epoch)
+            self.writer.add_scalar('tv_weight', current_tv_weight, global_step=epoch)
             
             # ==================== 停滞检测和恢复 ====================
             self.loss_history.append(avg_losses['total_loss'])
@@ -382,7 +436,7 @@ class Trainer:
     
     def save_checkpoint(self, epoch, optimizer, lr_scheduler, best_loss):
         """
-        保存模型checkpoint
+        保存模型checkpoint（只保存best.pth）
         
         Args:
             epoch (int): 当前epoch
@@ -400,10 +454,10 @@ class Trainer:
             'best_loss': best_loss,
         }
         
-        checkpoint_name = f'epoch{epoch:03d}-loss{best_loss:.3f}.pth'
+        checkpoint_name = 'best.pth'
         save_path = os.path.join(self.checkpoint_dir, checkpoint_name)
         torch.save(checkpoint, save_path)
-        print(f"保存checkpoint: {checkpoint_name}")
+        print(f"保存最佳模型: {checkpoint_name} (epoch {epoch}, loss {best_loss:.6f})")
     
     def load_checkpoint(self, checkpoint_path):
         """

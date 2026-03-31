@@ -1,20 +1,44 @@
 # -*- coding: utf-8 -*-
 """
 @file name:run_train.py
-@desc: 训练主程序入口 - 模块化版本
+@desc: 三阶段训练主程序入口 - 实现自编码器预训练、CBAM微调和融合层训练
 @Writer: wokaka209
-@Date: 2026-03-26
+@Date: 2026-03-31
 
 功能说明：
 ---------
-本脚本使用模块化的训练代码，提供清晰的结构和良好的可维护性。
+本脚本实现三阶段训练流程：
+1. 阶段一：自编码器预训练（仅可见光图像，不使用CBAM，损失函数：L1 + SSIM）
+2. 阶段二：CBAM微调（仅可见光图像，冻结主干权重，损失函数：L1 + SSIM）
+3. 阶段三：融合层训练（红外+可见光图像对，冻结Encoder，联合训练Decoder + Fusion Layer，损失函数：L1 + SSIM + Gradient + TV）
 
 使用方法：
 ---------
-    python run_train.py
+    # 完整三阶段训练
+    python run_train.py --train_all_stages
     
-    # 或带参数
-    python run_train.py --num_epochs 120 --optimize_en_ag
+    # 单独训练某个阶段
+    python run_train.py --stage 1
+    python run_train.py --stage 2 --resume_stage1 ./checkpoints/stage1/best.pth
+    python run_train.py --stage 3 --resume_stage2 ./checkpoints/stage2/best.pth
+    
+    # 从配置加载训练
+    python run_train.py --config train_configs.json --stage 3
+
+融合策略配置：
+-----------
+阶段三支持以下融合策略（在train_configs.json中配置）：
+- addition: 加法融合
+- l1_norm: L1范数加权融合（默认）
+- weighted_average: 加权平均融合
+
+损失函数配置：
+-----------
+每个阶段的损失函数在train_configs.json中独立配置：
+- L1 Loss (Pixel Loss): 像素级重建损失
+- SSIM Loss: 结构相似性损失
+- Gradient Loss: 梯度损失
+- TV Loss: 全变分损失
 
 模块结构：
 ---------
@@ -24,10 +48,21 @@ train/
 ├── loss_weights.py     # 损失权重管理器
 ├── trainer.py          # 训练器
 └── callbacks.py        # 回调函数
+
+models/
+├── DenseFuse.py                    # 基础DenseFuse模型
+├── DenseFuse_with_fusion.py        # 带融合层的DenseFuse模型
+├── fusion_layer.py                # 融合层模块
+└── attention_modules.py            # 注意力模块
+
+utils/
+├── util_dataset_ir_vi.py    # 红外-可见光数据集
+└── util_dataset_single.py   # 单图像数据集
 """
 
 import os
 import sys
+import json
 import argparse
 from datetime import datetime
 from torch.utils.data import DataLoader
@@ -38,227 +73,775 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # 导入训练模块
 from train import Trainer, create_run_directory
+from utils.util_dataset_single import SingleImageDataset, single_image_transform
 from utils.util_dataset_ir_vi import IrViDataset, image_transform
 from utils.util_loss import msssim, gradient_loss, tv_loss
 from utils.util_device import device_on
-from utils.utils import weights_init
-from models import fuse_model
+from models import fuse_model, fuse_model_with_fusion_layer
+from configs_loader import ConfigLoader, TrainingConfig
 
 
-def parse_args():
-    """解析命令行参数"""
-    parser = argparse.ArgumentParser(
-        description='红外可见光图像融合训练 - 模块化版本'
-    )
+def load_config(config_path: str = None):
+    """
+    从JSON配置文件加载训练配置
     
-    # 数据集参数
-    parser.add_argument('--ir_path', type=str, 
-                       default='E:/whx_Graduation project/baseline_project/dataset/ir',
-                       help='红外图像路径')
-    parser.add_argument('--vi_path', type=str,
-                       default='E:/whx_Graduation project/baseline_project/dataset/vi',
-                       help='可见光图像路径')
-    parser.add_argument('--gray', action='store_true', default=False,
-                       help='是否使用灰度模式')
+    Args:
+        config_path: 配置文件路径（可选，默认使用train_configs.json）
     
-    # 训练参数
-    parser.add_argument('--device', type=str, default=device_on(),
-                       help='训练设备')
-    parser.add_argument('--batch_size', type=int, default=16,
-                       help='批量大小')
-    parser.add_argument('--num_epochs', type=int, default=120,
-                       help='训练轮数')
-    parser.add_argument('--lr', type=float, default=2e-4,
-                       help='初始学习率')
-    parser.add_argument('--resume_path', type=str, default='',
-                       help='恢复训练的模型路径')
-    parser.add_argument('--num_workers', type=int, default=8,
-                       help='数据加载线程数')
+    Returns:
+        TrainingConfig: 训练配置对象
     
-    # 优化参数
-    parser.add_argument('--use_attention', action='store_true', default=True,
-                       help='使用注意力机制')
-    parser.add_argument('--warmup_epochs', type=int, default=5,
-                       help='学习率预热轮数')
-    parser.add_argument('--use_gradient_clipping', type=bool, default=True,
-                       help='梯度裁剪')
+    功能说明：
+    ---------
+    从外部JSON配置文件加载训练参数，替代原有的命令行参数解析。
+    支持配置文件的热重载和配置验证。
     
-    # 损失函数参数
-    parser.add_argument('--use_adaptive_weights', type=bool, default=True,
-                       help='自适应权重')
-    parser.add_argument('--optimize_en_ag', action='store_true', default=True,
-                       help='EN/AG优化模式')
-    parser.add_argument('--use_balanced_loss', type=bool, default=True,
-                       help='平衡损失模式')
+    使用示例：
+    ---------
+    ```python
+    # 使用默认配置
+    config = load_config()
     
-    # 学习率参数
-    parser.add_argument('--use_lr_decay', type=bool, default=True,
-                       help='学习率衰减')
+    # 使用自定义配置
+    config = load_config('custom_train_config.json')
     
-    # 输出参数
-    parser.add_argument('--output', action='store_true', default=True,
-                       help='显示输出')
-    
-    return parser.parse_args()
+    # 访问配置
+    batch_size = config.training['batch_size']
+    stage1_epochs = config.stage1['epochs']
+    ```
+    """
+    try:
+        config = TrainingConfig(config_path)
+        
+        if not config.validate():
+            raise ValueError("配置文件验证失败")
+        
+        print("[OK] 配置文件加载成功")
+        print(f"[OK] 配置文件路径: {config_path or 'train_configs.json'}")
+        
+        return config
+        
+    except FileNotFoundError as e:
+        print(f"[ERROR] 配置文件不存在: {e}")
+        raise
+    except json.JSONDecodeError as e:
+        print(f"[ERROR] JSON格式错误: {e}")
+        raise
+    except Exception as e:
+        print(f"[ERROR] 配置加载失败: {e}")
+        raise
 
 
-def print_config(args):
-    """打印训练配置"""
+def print_config(config, train_stage: int = 1, train_all: bool = False):
+    """
+    打印训练配置
+    
+    Args:
+        config: 训练配置对象或字典
+        train_stage: 当前训练阶段 (1、2 或 3)
+        train_all: 是否执行完整三阶段训练
+    """
+    print("=" * 100)
+    print("三阶段训练配置")
+    print("=" * 100)
+    
+    if isinstance(config, TrainingConfig):
+        config_dict = config.to_dict()
+    else:
+        config_dict = config
+    
+    print("\n[数据集配置]:")
+    print(f"  - 红外图像: {ConfigLoader.get_value(config_dict, 'dataset', 'ir_path')}")
+    print(f"  - 可见光图像: {ConfigLoader.get_value(config_dict, 'dataset', 'vi_path')}")
+    print(f"  - 灰度模式: {ConfigLoader.get_value(config_dict, 'dataset', 'gray')}")
+    
+    print("\n[训练阶段]:")
+    if train_all:
+        print(f"  - 执行完整三阶段训练")
+        print(f"  - 阶段一: {ConfigLoader.get_value(config_dict, 'stage1', 'epochs')} epochs, lr={ConfigLoader.get_value(config_dict, 'stage1', 'learning_rate')}")
+        print(f"  - 阶段二: {ConfigLoader.get_value(config_dict, 'stage2', 'epochs')} epochs, lr={ConfigLoader.get_value(config_dict, 'stage2', 'learning_rate')}")
+        print(f"  - 阶段三: {ConfigLoader.get_value(config_dict, 'stage3', 'epochs')} epochs, lr={ConfigLoader.get_value(config_dict, 'stage3', 'learning_rate')}")
+        print(f"  - 融合策略: {ConfigLoader.get_value(config_dict, 'stage3', 'fusion_config', 'strategy')}")
+    else:
+        print(f"  - 当前阶段: {train_stage}")
+        if train_stage == 1:
+            print(f"  - 训练轮数: {ConfigLoader.get_value(config_dict, 'stage1', 'epochs')}")
+            print(f"  - 学习率: {ConfigLoader.get_value(config_dict, 'stage1', 'learning_rate')}")
+        elif train_stage == 2:
+            print(f"  - 训练轮数: {ConfigLoader.get_value(config_dict, 'stage2', 'epochs')}")
+            print(f"  - 学习率: {ConfigLoader.get_value(config_dict, 'stage2', 'learning_rate')}")
+            print(f"  - 恢复路径: {ConfigLoader.get_value(config_dict, 'stage2', 'resume_stage1_path')}")
+        elif train_stage == 3:
+            print(f"  - 训练轮数: {ConfigLoader.get_value(config_dict, 'stage3', 'epochs')}")
+            print(f"  - 学习率: {ConfigLoader.get_value(config_dict, 'stage3', 'learning_rate')}")
+            print(f"  - 融合策略: {ConfigLoader.get_value(config_dict, 'stage3', 'fusion_config', 'strategy')}")
+            print(f"  - 恢复路径: {ConfigLoader.get_value(config_dict, 'stage3', 'resume_stage2_path')}")
+    
+    print("\n[训练参数]:")
+    print(f"  - 设备: {ConfigLoader.get_value(config_dict, 'training', 'device')}")
+    print(f"  - 批量大小: {ConfigLoader.get_value(config_dict, 'training', 'batch_size')}")
+    print(f"  - 预热轮数: {ConfigLoader.get_value(config_dict, 'optimizer', 'warmup_epochs')}")
+    
+    print("\n[优化参数]:")
+    print(f"  - 自适应权重: {ConfigLoader.get_value(config_dict, 'loss_function', 'use_adaptive_weights')}")
+    print(f"  - EN/AG优化: {ConfigLoader.get_value(config_dict, 'loss_function', 'optimize_en_ag')}")
+    print(f"  - 平衡损失: {ConfigLoader.get_value(config_dict, 'loss_function', 'use_balanced_loss')}")
+    print(f"  - 学习率衰减: {ConfigLoader.get_value(config_dict, 'optimizer', 'use_lr_decay')}")
+    print(f"  - 梯度裁剪: {ConfigLoader.get_value(config_dict, 'optimizer', 'use_gradient_clipping')}")
+    
+    print("\n[损失函数权值]:")
+    print(f"  - 权值模式: {'自适应调整' if ConfigLoader.get_value(config_dict, 'loss_function', 'use_adaptive_weights') else '手动设置'}")
+    print(f"  - L1 Loss默认权值: {ConfigLoader.get_value(config_dict, 'loss_function', 'weights', 'l1_weight')}")
+    print(f"  - SSIM Loss默认权值: {ConfigLoader.get_value(config_dict, 'loss_function', 'weights', 'ssim_weight')}")
+    print(f"  - Gradient Loss默认权值: {ConfigLoader.get_value(config_dict, 'loss_function', 'weights', 'grad_weight')}")
+    print(f"  - TV Loss默认权值: {ConfigLoader.get_value(config_dict, 'loss_function', 'weights', 'tv_weight')}")
+    
+    print("=" * 100)
+
+
+def train_stage1(config, resume_path: str = ''):
+    """
+    阶段一：自编码器预训练
+    
+    Args:
+        config: 训练配置对象
+        resume_path: 恢复训练路径（可选）
+    
+    输入：单张可见光图像
+    模型：编码器（不含CBAM）+ 解码器
+    目标：重建损失
+    可训练参数：全部参数
+    """
+    print("\n" + "=" * 60)
+    print("阶段一：自编码器预训练")
     print("=" * 60)
-    print("训练配置")
-    print("=" * 60)
     
-    print("\n📁 数据集配置:")
-    print(f"  - 红外图像: {args.ir_path}")
-    print(f"  - 可见光图像: {args.vi_path}")
-    print(f"  - 灰度模式: {args.gray}")
+    config_dict = config.to_dict()
     
-    print("\n⚙️ 训练参数:")
-    print(f"  - 设备: {args.device}")
-    print(f"  - 批量大小: {args.batch_size}")
-    print(f"  - 训练轮数: {args.num_epochs}")
-    print(f"  - 学习率: {args.lr}")
-    print(f"  - 预热轮数: {args.warmup_epochs}")
+    base_dir = ConfigLoader.get_value(config_dict, 'training', 'base_dir', default='./runs')
+    vi_path = ConfigLoader.get_value(config_dict, 'dataset', 'vi_path')
+    gray = ConfigLoader.get_value(config_dict, 'dataset', 'gray', default=False)
+    device = ConfigLoader.get_value(config_dict, 'training', 'device')
+    batch_size = ConfigLoader.get_value(config_dict, 'training', 'batch_size')
+    num_workers = ConfigLoader.get_value(config_dict, 'training', 'num_workers', default=8)
+    stage1_epochs = ConfigLoader.get_value(config_dict, 'stage1', 'epochs')
+    stage1_lr = ConfigLoader.get_value(config_dict, 'stage1', 'learning_rate')
+    warmup_epochs = ConfigLoader.get_value(config_dict, 'optimizer', 'warmup_epochs', default=5)
+    use_gradient_clipping = ConfigLoader.get_value(config_dict, 'optimizer', 'use_gradient_clipping', default=True)
+    use_adaptive_weights = ConfigLoader.get_value(config_dict, 'loss_function', 'use_adaptive_weights', default=True)
+    optimize_en_ag = ConfigLoader.get_value(config_dict, 'loss_function', 'optimize_en_ag', default=True)
+    use_balanced_loss = ConfigLoader.get_value(config_dict, 'loss_function', 'use_balanced_loss', default=True)
+    use_lr_decay = ConfigLoader.get_value(config_dict, 'optimizer', 'use_lr_decay', default=True)
+    l1_weight = ConfigLoader.get_value(config_dict, 'loss_function', 'weights', 'l1_weight', default=1.0)
+    ssim_weight = ConfigLoader.get_value(config_dict, 'loss_function', 'weights', 'ssim_weight', default=100.0)
+    grad_weight = ConfigLoader.get_value(config_dict, 'loss_function', 'weights', 'grad_weight', default=5.0)
+    tv_weight = ConfigLoader.get_value(config_dict, 'loss_function', 'weights', 'tv_weight', default=0.1)
     
-    print("\n🔧 优化参数:")
-    print(f"  - 使用注意力机制: {args.use_attention}")
-    print(f"  - 自适应权重: {args.use_adaptive_weights}")
-    print(f"  - EN/AG优化: {args.optimize_en_ag}")
-    print(f"  - 平衡损失: {args.use_balanced_loss}")
-    print(f"  - 学习率衰减: {args.use_lr_decay}")
-    print(f"  - 梯度裁剪: {args.use_gradient_clipping}")
+    stage1_dir = os.path.join(base_dir, 'stage1_autoencoder')
+    os.makedirs(stage1_dir, exist_ok=True)
+    checkpoint_dir = os.path.join(stage1_dir, 'checkpoints')
+    log_dir = os.path.join(stage1_dir, 'logs')
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
     
-    print("\n📊 损失函数组合:")
-    print("  Total_Loss = λ1×L1 + λ2×(1-SSIM) + λ3×Grad + λ4×TV")
-    print(f"  - EN/AG优化模式: {'启用' if args.optimize_en_ag else '禁用'}")
-    
-    print("=" * 60)
-
-
-def main():
-    """主函数"""
-    # 解析参数
-    args = parse_args()
-    
-    # 打印配置
-    if args.output:
-        print_config(args)
-    
-    # 创建运行目录
-    run_dir, checkpoint_dir, log_dir = create_run_directory(args)
-    
-    # 加载数据集
-    print("\n📦 加载数据集...")
-    dataset = IrViDataset(
-        ir_path=args.ir_path,
-        vi_path=args.vi_path,
-        transform=image_transform(gray=args.gray, augment=True),
-        gray=args.gray
+    print("\n[加载数据集]（阶段一：仅可见光图像）...")
+    dataset = SingleImageDataset(
+        image_path=vi_path,
+        transform=single_image_transform(gray=gray, augment=True),
+        gray=gray
     )
     
     train_loader = DataLoader(
         dataset=dataset,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         shuffle=True,
-        num_workers=args.num_workers
+        num_workers=num_workers
     )
-    print(f"✓ 数据集加载完成: {len(dataset)} 样本")
+    print(f"[OK] 数据集加载完成: {len(dataset)} 样本")
     
-    # 初始化模型
-    print("\n🏗️ 初始化模型...")
+    print("\n[初始化模型]（阶段一：不含CBAM）...")
     model = fuse_model(
         model_name="DenseFuse",
-        input_nc=1 if args.gray else 3,
-        output_nc=1 if args.gray else 3,
-        use_attention=args.use_attention
+        input_nc=1 if gray else 3,
+        output_nc=1 if gray else 3,
+        use_attention=False
     )
-    model = model.to(args.device)
+    model = model.to(device)
     
-    # 打印模型信息
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"✓ 模型加载完成: {total_params:,} 参数")
+    print(f"[OK] 模型加载完成: {total_params:,} 参数")
     
-    # 创建优化器
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=args.lr,
+        lr=stage1_lr,
         weight_decay=1e-4
     )
-    print(f"✓ 优化器创建完成: AdamW(lr={args.lr})")
+    print(f"[OK] 优化器创建完成: AdamW(lr={stage1_lr})")
     
-    # 损失函数
-    l1_loss_fn = torch.nn.L1Loss().to(args.device)
-    print("✓ 损失函数加载完成")
+    l1_loss_fn = torch.nn.L1Loss().to(device)
+    print("[OK] 损失函数加载完成")
     
-    # 创建训练器
-    print("\n🚀 创建训练器...")
+    stage1_loss_config = ConfigLoader.get_value(config_dict, 'stage1', 'loss_config', default={})
+    
+    l1_loss_enabled = ConfigLoader.get_value(stage1_loss_config, 'l1_loss', 'enabled', default=True)
+    ssim_loss_enabled = ConfigLoader.get_value(stage1_loss_config, 'ssim_loss', 'enabled', default=True)
+    grad_loss_enabled = ConfigLoader.get_value(stage1_loss_config, 'gradient_loss', 'enabled', default=False)
+    tv_loss_enabled = ConfigLoader.get_value(stage1_loss_config, 'tv_loss', 'enabled', default=False)
+    
+    l1_loss_weight = ConfigLoader.get_value(stage1_loss_config, 'l1_loss', 'weight', default=1.0)
+    ssim_loss_weight = ConfigLoader.get_value(stage1_loss_config, 'ssim_loss', 'weight', default=100.0)
+    grad_loss_weight = ConfigLoader.get_value(stage1_loss_config, 'gradient_loss', 'weight', default=5.0)
+    tv_loss_weight = ConfigLoader.get_value(stage1_loss_config, 'tv_loss', 'weight', default=0.1)
+    
+    print("\n[损失函数配置]（阶段一）:")
+    print(f"  L1 Loss: {'启用' if l1_loss_enabled else '禁用'} (weight={l1_loss_weight})")
+    print(f"  SSIM Loss: {'启用' if ssim_loss_enabled else '禁用'} (weight={ssim_loss_weight})")
+    print(f"  Gradient Loss: {'启用' if grad_loss_enabled else '禁用'} (weight={grad_loss_weight})")
+    print(f"  TV Loss: {'启用' if tv_loss_enabled else '禁用'} (weight={tv_loss_weight})")
+    
+    grad_loss_fn_used = gradient_loss if grad_loss_enabled else None
+    tv_loss_fn_used = tv_loss if tv_loss_enabled else None
+    
+    print("\n[创建训练器]...")
     trainer = Trainer(
         model=model,
         optimizer=optimizer,
         train_loader=train_loader,
-        device=args.device,
-        loss_fn=l1_loss_fn,
-        ssim_loss_fn=msssim,
-        grad_loss_fn=gradient_loss,
-        tv_loss_fn=tv_loss,
+        device=device,
+        loss_fn=l1_loss_fn if l1_loss_enabled else None,
+        ssim_loss_fn=msssim if ssim_loss_enabled else None,
+        grad_loss_fn=grad_loss_fn_used,
+        tv_loss_fn=tv_loss_fn_used,
         checkpoint_dir=checkpoint_dir,
         log_dir=log_dir,
-        warmup_epochs=args.warmup_epochs,
-        initial_lr=args.lr,
-        use_gradient_clipping=args.use_gradient_clipping
+        warmup_epochs=warmup_epochs,
+        initial_lr=stage1_lr,
+        use_gradient_clipping=use_gradient_clipping
     )
     
-    # 处理恢复训练
     init_epoch = 0
-    if args.resume_path:
-        print(f"\n📥 恢复训练: {args.resume_path}")
-        
-        if not os.path.exists(args.resume_path):
-            print(f"❌ 错误: 模型文件不存在")
-            return
-        
-        try:
-            checkpoint = torch.load(
-                args.resume_path,
-                map_location=args.device,
-                weights_only=False
-            )
-            
-            model.load_state_dict(checkpoint['model'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            init_epoch = checkpoint['epoch'] + 1
-            
-            print(f"✓ 模型加载成功")
-            print(f"✓ 从epoch {init_epoch} 继续训练")
-            
-        except Exception as e:
-            print(f"❌ 错误: 加载模型失败 - {e}")
-            return
+    if resume_path:
+        print(f"\n[恢复训练]: {resume_path}")
+        if os.path.exists(resume_path):
+            try:
+                checkpoint = torch.load(
+                    resume_path,
+                    map_location=device,
+                    weights_only=False
+                )
+                model.load_state_dict(checkpoint['model'])
+                optimizer.load_state_dict(checkpoint['optimizer'])
+                init_epoch = checkpoint['epoch'] + 1
+                print(f"[OK] 模型加载成功")
+                print(f"[OK] 从epoch {init_epoch} 继续训练")
+            except Exception as e:
+                print(f"[ERROR] 错误: 加载模型失败 - {e}")
+                return None
+        else:
+            print(f"[ERROR] 错误: 模型文件不存在")
+            return None
     
-    # 开始训练
     print("\n" + "=" * 60)
-    print("开始训练")
+    print("开始训练 - 阶段一")
     print("=" * 60 + "\n")
     
     results = trainer.train(
-        num_epochs=args.num_epochs,
+        num_epochs=stage1_epochs,
         init_epoch=init_epoch,
-        use_adaptive_weights=args.use_adaptive_weights,
-        optimize_en_ag=args.optimize_en_ag,
-        use_balanced_loss=args.use_balanced_loss,
-        use_lr_decay=args.use_lr_decay
+        use_adaptive_weights=use_adaptive_weights,
+        optimize_en_ag=optimize_en_ag,
+        use_balanced_loss=use_balanced_loss,
+        use_lr_decay=use_lr_decay,
+        l1_weight=l1_weight if not use_adaptive_weights else None,
+        ssim_weight=ssim_weight if not use_adaptive_weights else None,
+        grad_weight=grad_weight if not use_adaptive_weights else None,
+        tv_weight=tv_weight if not use_adaptive_weights else None
     )
     
-    # 打印结果
+    best_model_path = os.path.join(checkpoint_dir, 'best.pth')
+    print(f"\n[OK] 阶段一最佳模型: {best_model_path}")
+    
+    return {
+        'model_path': best_model_path,
+        'best_loss': results['best_loss'],
+        'training_time': results['training_time']
+    }
+
+
+def train_stage2(config, resume_stage1_path: str = '', resume_path: str = ''):
+    """
+    阶段二：CBAM微调
+    
+    Args:
+        config: 训练配置对象
+        resume_stage1_path: 阶段一模型路径（用于加载权重）
+        resume_path: 恢复训练路径（可选）
+    
+    输入：单张可见光图像
+    模型：编码器（含CBAM）+ 解码器
+    目标：重建损失
+    可训练参数：仅CBAM模块（冻结主干权重）
+    """
     print("\n" + "=" * 60)
-    print("训练完成")
+    print("阶段二：CBAM微调")
     print("=" * 60)
-    print(f"✓ 最佳损失: {results['best_loss']:.6f}")
-    print(f"✓ 训练时间: {results['training_time']:.2f}秒")
-    print(f"✓ 训练轮数: {results['num_epochs']}")
-    print(f"✓ 模型保存: {checkpoint_dir}")
-    print(f"✓ 日志记录: {log_dir}")
+    
+    config_dict = config.to_dict()
+    
+    if not resume_stage1_path:
+        resume_stage1_path = ConfigLoader.get_value(config_dict, 'stage2', 'resume_stage1_path')
+    
+    if not os.path.exists(resume_stage1_path):
+        print(f"[ERROR] 错误: 阶段一模型文件不存在: {resume_stage1_path}")
+        return None
+    
+    base_dir = ConfigLoader.get_value(config_dict, 'training', 'base_dir', default='./runs')
+    vi_path = ConfigLoader.get_value(config_dict, 'dataset', 'vi_path')
+    gray = ConfigLoader.get_value(config_dict, 'dataset', 'gray', default=False)
+    device = ConfigLoader.get_value(config_dict, 'training', 'device')
+    batch_size = ConfigLoader.get_value(config_dict, 'training', 'batch_size')
+    num_workers = ConfigLoader.get_value(config_dict, 'training', 'num_workers', default=8)
+    stage2_epochs = ConfigLoader.get_value(config_dict, 'stage2', 'epochs')
+    stage2_lr = ConfigLoader.get_value(config_dict, 'stage2', 'learning_rate')
+    warmup_epochs = ConfigLoader.get_value(config_dict, 'optimizer', 'warmup_epochs', default=5)
+    use_gradient_clipping = ConfigLoader.get_value(config_dict, 'optimizer', 'use_gradient_clipping', default=True)
+    use_adaptive_weights = ConfigLoader.get_value(config_dict, 'loss_function', 'use_adaptive_weights', default=True)
+    optimize_en_ag = ConfigLoader.get_value(config_dict, 'loss_function', 'optimize_en_ag', default=True)
+    use_balanced_loss = ConfigLoader.get_value(config_dict, 'loss_function', 'use_balanced_loss', default=True)
+    use_lr_decay = ConfigLoader.get_value(config_dict, 'optimizer', 'use_lr_decay', default=True)
+    l1_weight = ConfigLoader.get_value(config_dict, 'loss_function', 'weights', 'l1_weight', default=1.0)
+    ssim_weight = ConfigLoader.get_value(config_dict, 'loss_function', 'weights', 'ssim_weight', default=100.0)
+    grad_weight = ConfigLoader.get_value(config_dict, 'loss_function', 'weights', 'grad_weight', default=5.0)
+    tv_weight = ConfigLoader.get_value(config_dict, 'loss_function', 'weights', 'tv_weight', default=0.1)
+    
+    stage2_dir = os.path.join(base_dir, 'stage2_cbam')
+    os.makedirs(stage2_dir, exist_ok=True)
+    checkpoint_dir = os.path.join(stage2_dir, 'checkpoints')
+    log_dir = os.path.join(stage2_dir, 'logs')
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+    
+    print("\n[加载数据集]（阶段二：仅可见光图像）...")
+    dataset = SingleImageDataset(
+        image_path=vi_path,
+        transform=single_image_transform(gray=gray, augment=True),
+        gray=gray
+    )
+    
+    train_loader = DataLoader(
+        dataset=dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers
+    )
+    print(f"[OK] 数据集加载完成: {len(dataset)} 样本")
+    
+    print("\n[初始化模型]（阶段二：含CBAM）...")
+    model = fuse_model(
+        model_name="DenseFuse",
+        input_nc=1 if gray else 3,
+        output_nc=1 if gray else 3,
+        use_attention=True
+    )
+    model = model.to(device)
+    
+    print(f"\n[加载阶段一权重]: {resume_stage1_path}")
+    try:
+        checkpoint = torch.load(resume_stage1_path, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint['model'], strict=False)
+        print("[OK] 阶段一权重加载成功")
+    except Exception as e:
+        print(f"[ERROR] 错误: 加载阶段一权重失败 - {e}")
+        return None
+    
+    print("\n[冻结主干权重]，仅训练CBAM模块...")
+    model.freeze_backbone()
+    model.unfreeze_cbam()
+    
+    trainable_params = model.get_trainable_params()
+    cbam_params = model.get_cbam_params()
+    print(f"[OK] 可训练参数数量: {sum(p.numel() for p in trainable_params):,}")
+    print(f"[OK] CBAM参数数量: {sum(p.numel() for p in cbam_params):,}")
+    
+    optimizer = torch.optim.AdamW(
+        cbam_params,
+        lr=stage2_lr,
+        weight_decay=1e-4
+    )
+    print(f"[OK] 优化器创建完成: AdamW(lr={stage2_lr})")
+    
+    l1_loss_fn = torch.nn.L1Loss().to(device)
+    print("[OK] 损失函数加载完成")
+    
+    stage2_loss_config = ConfigLoader.get_value(config_dict, 'stage2', 'loss_config', default={})
+    
+    l1_loss_enabled = ConfigLoader.get_value(stage2_loss_config, 'l1_loss', 'enabled', default=True)
+    ssim_loss_enabled = ConfigLoader.get_value(stage2_loss_config, 'ssim_loss', 'enabled', default=True)
+    grad_loss_enabled = ConfigLoader.get_value(stage2_loss_config, 'gradient_loss', 'enabled', default=False)
+    tv_loss_enabled = ConfigLoader.get_value(stage2_loss_config, 'tv_loss', 'enabled', default=False)
+    
+    l1_loss_weight = ConfigLoader.get_value(stage2_loss_config, 'l1_loss', 'weight', default=1.0)
+    ssim_loss_weight = ConfigLoader.get_value(stage2_loss_config, 'ssim_loss', 'weight', default=100.0)
+    grad_loss_weight = ConfigLoader.get_value(stage2_loss_config, 'gradient_loss', 'weight', default=5.0)
+    tv_loss_weight = ConfigLoader.get_value(stage2_loss_config, 'tv_loss', 'weight', default=0.1)
+    
+    print("\n[损失函数配置]（阶段二）:")
+    print(f"  L1 Loss: {'启用' if l1_loss_enabled else '禁用'} (weight={l1_loss_weight})")
+    print(f"  SSIM Loss: {'启用' if ssim_loss_enabled else '禁用'} (weight={ssim_loss_weight})")
+    print(f"  Gradient Loss: {'启用' if grad_loss_enabled else '禁用'} (weight={grad_loss_weight})")
+    print(f"  TV Loss: {'启用' if tv_loss_enabled else '禁用'} (weight={tv_loss_weight})")
+    
+    grad_loss_fn_used = gradient_loss if grad_loss_enabled else None
+    tv_loss_fn_used = tv_loss if tv_loss_enabled else None
+    
+    print("\n[创建训练器]...")
+    trainer = Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=train_loader,
+        device=device,
+        loss_fn=l1_loss_fn if l1_loss_enabled else None,
+        ssim_loss_fn=msssim if ssim_loss_enabled else None,
+        grad_loss_fn=grad_loss_fn_used,
+        tv_loss_fn=tv_loss_fn_used,
+        checkpoint_dir=checkpoint_dir,
+        log_dir=log_dir,
+        warmup_epochs=warmup_epochs,
+        initial_lr=stage2_lr,
+        use_gradient_clipping=use_gradient_clipping
+    )
+    
+    init_epoch = 0
+    if resume_path:
+        print(f"\n[恢复训练]: {resume_path}")
+        if os.path.exists(resume_path):
+            try:
+                checkpoint = torch.load(
+                    resume_path,
+                    map_location=device,
+                    weights_only=False
+                )
+                model.load_state_dict(checkpoint['model'])
+                optimizer.load_state_dict(checkpoint['optimizer'])
+                init_epoch = checkpoint['epoch'] + 1
+                print(f"[OK] 模型加载成功")
+                print(f"[OK] 从epoch {init_epoch} 继续训练")
+            except Exception as e:
+                print(f"[ERROR] 错误: 加载模型失败 - {e}")
+                return None
+        else:
+            print(f"[ERROR] 错误: 模型文件不存在")
+            return None
+    
+    print("\n" + "=" * 60)
+    print("开始训练 - 阶段二")
+    print("=" * 60 + "\n")
+    
+    results = trainer.train(
+        num_epochs=stage2_epochs,
+        init_epoch=init_epoch,
+        use_adaptive_weights=use_adaptive_weights,
+        optimize_en_ag=optimize_en_ag,
+        use_balanced_loss=use_balanced_loss,
+        use_lr_decay=use_lr_decay,
+        l1_weight=l1_weight if not use_adaptive_weights else None,
+        ssim_weight=ssim_weight if not use_adaptive_weights else None,
+        grad_weight=grad_weight if not use_adaptive_weights else None,
+        tv_weight=tv_weight if not use_adaptive_weights else None
+    )
+    
+    best_model_path = os.path.join(checkpoint_dir, 'best.pth')
+    print(f"\n[OK] 阶段二最佳模型: {best_model_path}")
+    
+    return {
+        'model_path': best_model_path,
+        'best_loss': results['best_loss'],
+        'training_time': results['training_time']
+    }
+
+
+def train_stage3(config, resume_stage2_path: str = '', resume_path: str = ''):
+    """
+    阶段三：融合层训练
+    
+    Args:
+        config: 训练配置对象
+        resume_stage2_path: 阶段二模型路径（用于加载权重）
+        resume_path: 恢复训练路径（可选）
+    
+    输入：红外+可见光图像对
+    模型：编码器（含CBAM）+ 融合层 + 解码器
+    目标：融合损失
+    可训练参数：Decoder + Fusion Layer（冻结Encoder和CBAM）
+    """
+    print("\n" + "=" * 60)
+    print("阶段三：融合层训练")
     print("=" * 60)
+    
+    config_dict = config.to_dict()
+    
+    if not resume_stage2_path:
+        resume_stage2_path = ConfigLoader.get_value(config_dict, 'stage3', 'resume_stage2_path')
+    
+    if not os.path.exists(resume_stage2_path):
+        print(f"[ERROR] 错误: 阶段二模型文件不存在: {resume_stage2_path}")
+        return None
+    
+    base_dir = ConfigLoader.get_value(config_dict, 'training', 'base_dir', default='./runs')
+    ir_path = ConfigLoader.get_value(config_dict, 'dataset', 'ir_path')
+    vi_path = ConfigLoader.get_value(config_dict, 'dataset', 'vi_path')
+    gray = ConfigLoader.get_value(config_dict, 'dataset', 'gray', default=False)
+    device = ConfigLoader.get_value(config_dict, 'training', 'device')
+    batch_size = ConfigLoader.get_value(config_dict, 'training', 'batch_size')
+    num_workers = ConfigLoader.get_value(config_dict, 'training', 'num_workers', default=8)
+    stage3_epochs = ConfigLoader.get_value(config_dict, 'stage3', 'epochs')
+    stage3_lr = ConfigLoader.get_value(config_dict, 'stage3', 'learning_rate')
+    warmup_epochs = ConfigLoader.get_value(config_dict, 'optimizer', 'warmup_epochs', default=5)
+    use_gradient_clipping = ConfigLoader.get_value(config_dict, 'optimizer', 'use_gradient_clipping', default=True)
+    use_adaptive_weights = ConfigLoader.get_value(config_dict, 'loss_function', 'use_adaptive_weights', default=False)
+    optimize_en_ag = ConfigLoader.get_value(config_dict, 'loss_function', 'optimize_en_ag', default=True)
+    use_balanced_loss = ConfigLoader.get_value(config_dict, 'loss_function', 'use_balanced_loss', default=False)
+    use_lr_decay = ConfigLoader.get_value(config_dict, 'optimizer', 'use_lr_decay', default=True)
+    
+    fusion_strategy = ConfigLoader.get_value(config_dict, 'stage3', 'fusion_config', 'strategy', default='l1_norm')
+    
+    stage3_dir = os.path.join(base_dir, 'stage3_fusion')
+    os.makedirs(stage3_dir, exist_ok=True)
+    checkpoint_dir = os.path.join(stage3_dir, 'checkpoints')
+    log_dir = os.path.join(stage3_dir, 'logs')
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+    
+    print("\n[加载数据集]（阶段三：红外+可见光图像对）...")
+    dataset = IrViDataset(
+        ir_path=ir_path,
+        vi_path=vi_path,
+        transform=image_transform(gray=gray, augment=True),
+        gray=gray
+    )
+    
+    train_loader = DataLoader(
+        dataset=dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers
+    )
+    print(f"[OK] 数据集加载完成: {len(dataset)} 样本")
+    
+    print(f"\n[初始化模型]（阶段三：Decoder + Fusion Layer）...")
+    model = fuse_model_with_fusion_layer(
+        model_name="DenseFuse",
+        input_nc=1 if gray else 3,
+        output_nc=1 if gray else 3,
+        use_attention=True,
+        fusion_strategy=fusion_strategy
+    )
+    model = model.to(device)
+    
+    print(f"\n[加载阶段二权重]: {resume_stage2_path}")
+    try:
+        checkpoint = torch.load(resume_stage2_path, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint['model'], strict=False)
+        print("[OK] 阶段二权重加载成功")
+    except Exception as e:
+        print(f"[ERROR] 错误: 加载阶段二权重失败 - {e}")
+        return None
+    
+    print("\n[冻结Encoder和CBAM，仅训练Decoder + Fusion Layer]...")
+    model.freeze_encoder()
+    model.freeze_cbam()
+    model.unfreeze_decoder()
+    model.unfreeze_fusion_layer()
+    
+    trainable_params = model.get_trainable_params()
+    decoder_params = model.get_decoder_params()
+    fusion_params = model.get_fusion_params()
+    print(f"[OK] 可训练参数数量: {sum(p.numel() for p in trainable_params):,}")
+    print(f"[OK] Decoder参数数量: {sum(p.numel() for p in decoder_params):,}")
+    print(f"[OK] Fusion Layer参数数量: {sum(p.numel() for p in fusion_params):,}")
+    
+    all_trainable_params = list(decoder_params) + list(fusion_params)
+    optimizer = torch.optim.AdamW(
+        all_trainable_params,
+        lr=stage3_lr,
+        weight_decay=1e-4
+    )
+    print(f"[OK] 优化器创建完成: AdamW(lr={stage3_lr})")
+    
+    l1_loss_fn = torch.nn.L1Loss().to(device)
+    print("[OK] 损失函数加载完成")
+    
+    stage3_loss_config = ConfigLoader.get_value(config_dict, 'stage3', 'loss_config', default={})
+    
+    l1_loss_enabled = ConfigLoader.get_value(stage3_loss_config, 'l1_loss', 'enabled', default=True)
+    ssim_loss_enabled = ConfigLoader.get_value(stage3_loss_config, 'ssim_loss', 'enabled', default=True)
+    grad_loss_enabled = ConfigLoader.get_value(stage3_loss_config, 'gradient_loss', 'enabled', default=True)
+    tv_loss_enabled = ConfigLoader.get_value(stage3_loss_config, 'tv_loss', 'enabled', default=True)
+    
+    l1_loss_weight = ConfigLoader.get_value(stage3_loss_config, 'l1_loss', 'weight', default=1.0)
+    ssim_loss_weight = ConfigLoader.get_value(stage3_loss_config, 'ssim_loss', 'weight', default=100.0)
+    grad_loss_weight = ConfigLoader.get_value(stage3_loss_config, 'gradient_loss', 'weight', default=5.0)
+    tv_loss_weight = ConfigLoader.get_value(stage3_loss_config, 'tv_loss', 'weight', default=0.1)
+    
+    print(f"\n[融合策略配置]: {fusion_strategy}")
+    print("\n[损失函数配置]（阶段三）:")
+    print(f"  L1 Loss: {'启用' if l1_loss_enabled else '禁用'} (weight={l1_loss_weight})")
+    print(f"  SSIM Loss: {'启用' if ssim_loss_enabled else '禁用'} (weight={ssim_loss_weight})")
+    print(f"  Gradient Loss: {'启用' if grad_loss_enabled else '禁用'} (weight={grad_loss_weight})")
+    print(f"  TV Loss: {'启用' if tv_loss_enabled else '禁用'} (weight={tv_loss_weight})")
+    
+    grad_loss_fn_used = gradient_loss if grad_loss_enabled else None
+    tv_loss_fn_used = tv_loss if tv_loss_enabled else None
+    
+    print("\n[创建训练器]...")
+    trainer = Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=train_loader,
+        device=device,
+        loss_fn=l1_loss_fn if l1_loss_enabled else None,
+        ssim_loss_fn=msssim if ssim_loss_enabled else None,
+        grad_loss_fn=grad_loss_fn_used,
+        tv_loss_fn=tv_loss_fn_used,
+        checkpoint_dir=checkpoint_dir,
+        log_dir=log_dir,
+        warmup_epochs=warmup_epochs,
+        initial_lr=stage3_lr,
+        use_gradient_clipping=use_gradient_clipping
+    )
+    
+    init_epoch = 0
+    if resume_path:
+        print(f"\n[恢复训练]: {resume_path}")
+        if os.path.exists(resume_path):
+            try:
+                checkpoint = torch.load(
+                    resume_path,
+                    map_location=device,
+                    weights_only=False
+                )
+                model.load_state_dict(checkpoint['model'])
+                optimizer.load_state_dict(checkpoint['optimizer'])
+                init_epoch = checkpoint['epoch'] + 1
+                print(f"[OK] 模型加载成功")
+                print(f"[OK] 从epoch {init_epoch} 继续训练")
+            except Exception as e:
+                print(f"[ERROR] 错误: 加载模型失败 - {e}")
+                return None
+        else:
+            print(f"[ERROR] 错误: 模型文件不存在")
+            return None
+    
+    print("\n" + "=" * 60)
+    print("开始训练 - 阶段三")
+    print("=" * 60 + "\n")
+    
+    results = trainer.train(
+        num_epochs=stage3_epochs,
+        init_epoch=init_epoch,
+        use_adaptive_weights=use_adaptive_weights,
+        optimize_en_ag=optimize_en_ag,
+        use_balanced_loss=use_balanced_loss,
+        use_lr_decay=use_lr_decay,
+        l1_weight=l1_loss_weight if not use_adaptive_weights else None,
+        ssim_weight=ssim_loss_weight if not use_adaptive_weights else None,
+        grad_weight=grad_loss_weight if not use_adaptive_weights else None,
+        tv_weight=tv_loss_weight if not use_adaptive_weights else None
+    )
+    
+    best_model_path = os.path.join(checkpoint_dir, 'best.pth')
+    print(f"\n[OK] 阶段三最佳模型: {best_model_path}")
+    
+    return {
+        'model_path': best_model_path,
+        'best_loss': results['best_loss'],
+        'training_time': results['training_time']
+    }
+
+
+def main():
+    """主函数"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='三阶段红外可见光图像融合训练')
+    parser.add_argument('--train_all_stages', action='store_true', default=False,
+                       help='执行完整的三阶段训练')
+    parser.add_argument('--stage', type=int, choices=[1, 2, 3], default=1,
+                       help='选择训练阶段 (1: 自编码器预训练, 2: CBAM微调, 3: 融合层训练)')
+    parser.add_argument('--config', type=str, default=None,
+                       help='配置文件路径（可选，默认使用train_configs.json）')
+    parser.add_argument('--resume_stage1', type=str, default='',
+                       help='阶段一模型路径（用于阶段二）')
+    parser.add_argument('--resume_stage2', type=str, default='',
+                       help='阶段二模型路径（用于阶段三）')
+    parser.add_argument('--resume_path', type=str, default='',
+                       help='恢复训练的模型路径（可选）')
+    
+    args = parser.parse_args()
+    
+    try:
+        config = load_config(args.config)
+        print_config(config, train_stage=args.stage, train_all=args.train_all_stages)
+        
+        base_dir = ConfigLoader.get_value(config.to_dict(), 'training', 'base_dir', default='./runs')
+        os.makedirs(base_dir, exist_ok=True)
+        
+        if args.train_all_stages:
+            print("\n[开始完整三阶段训练]...")
+            
+            stage1_result = train_stage1(config)
+            if stage1_result is None:
+                print("\n[ERROR] 阶段一训练失败")
+                return
+            
+            stage2_result = train_stage2(config, resume_stage1_path=stage1_result['model_path'])
+            if stage2_result is None:
+                print("\n[ERROR] 阶段二训练失败")
+                return
+            
+            stage3_result = train_stage3(config, resume_stage2_path=stage2_result['model_path'])
+            if stage3_result is None:
+                print("\n[ERROR] 阶段三训练失败")
+                return
+            
+            print("\n" + "=" * 60)
+            print("三阶段训练完成")
+            print("=" * 60)
+            print(f"[OK] 阶段一最佳损失: {stage1_result['best_loss']:.6f}")
+            print(f"[OK] 阶段二最佳损失: {stage2_result['best_loss']:.6f}")
+            print(f"[OK] 阶段三最佳损失: {stage3_result['best_loss']:.6f}")
+            print(f"[OK] 总训练时间: {stage1_result['training_time'] + stage2_result['training_time'] + stage3_result['training_time']:.2f}秒")
+            print(f"[OK] 最终模型: {stage3_result['model_path']}")
+            print("=" * 60)
+            
+        else:
+            print(f"\n[开始阶段 {args.stage} 训练]...")
+            
+            if args.stage == 1:
+                result = train_stage1(config, resume_path=args.resume_path)
+            elif args.stage == 2:
+                resume_stage1 = args.resume_stage1 if args.resume_stage1 else ''
+                result = train_stage2(config, resume_stage1_path=resume_stage1, resume_path=args.resume_path)
+            elif args.stage == 3:
+                resume_stage2 = args.resume_stage2 if args.resume_stage2 else ''
+                result = train_stage3(config, resume_stage2_path=resume_stage2, resume_path=args.resume_path)
+            
+            if result is None:
+                print(f"\n[ERROR] 阶段 {args.stage} 训练失败")
+                return
+            
+            print("\n" + "=" * 60)
+            print(f"阶段 {args.stage} 训练完成")
+            print("=" * 60)
+            print(f"[OK] 最佳损失: {result['best_loss']:.6f}")
+            print(f"[OK] 训练时间: {result['training_time']:.2f}秒")
+            print(f"[OK] 模型保存: {result['model_path']}")
+            print("=" * 60)
+    
+    except Exception as e:
+        print(f"\n[ERROR] 程序执行失败: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == '__main__':

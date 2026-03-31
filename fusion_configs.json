@@ -1,0 +1,101 @@
+{
+    "description": "图像融合配置文件 - 包含融合引擎的所有配置参数",
+    "version": "1.0",
+    "author": "wokaka209",
+    "date": "2026-03-31",
+
+    "io_paths": {
+        "single_mode": {
+            "ir_image": "",
+            "vi_image": "",
+            "output": "data_result/fusion_optimized"
+        },
+        "batch_mode": {
+            "ir_dir": "E:/whx_Graduation project/baseline_project/dataset/ir",
+            "vi_dir": "E:/whx_Graduation project/baseline_project/dataset/vi",
+            "output_dir": "data_result/fusion_optimized"
+        }
+    },
+
+    "model": {
+        "model_path": "./runs/stage2_cbam/checkpoints/best.pth",
+        "model_name": "DenseFuse",
+        "input_channels": 3,
+        "output_channels": 3,
+        "gray_mode": false,
+        "target_size": [768, 1024],
+        "use_attention": true,
+        "fusion_strategy": "l1_norm"
+    },
+
+    "device": {
+        "type": "cuda",
+        "available_options": ["cuda", "cpu"]
+    },
+
+    "performance": {
+        "batch_size": 1,
+        "recommended_batch_range": [4, 8],
+        "show_stats": true,
+        "num_workers": 4,
+        "enable_cuda_optimize": true,
+        "enable_mixed_precision": false
+    },
+
+    "fusion_strategies": {
+        "available": [
+            "addition",
+            "l1_norm",
+            "weighted_average"
+        ],
+        "default": "l1_norm",
+        "description": {
+            "addition": "加法融合策略",
+            "l1_norm": "L1范数加权融合",
+            "weighted_average": "加权平均融合"
+        }
+    },
+
+    "image_preprocessing": {
+        "resize": {
+            "enabled": true,
+            "target_size": [768, 1024]
+        },
+        "normalize": {
+            "enabled": true,
+            "mean": [0.5, 0.5, 0.5],
+            "std": [0.5, 0.5, 0.5]
+        },
+        "to_tensor": true
+    },
+
+    "image_postprocessing": {
+        "denormalize": true,
+        "clamp_range": [0, 1],
+        "restore_original_size": true
+    },
+
+    "optimization": {
+        "memory": {
+            "preallocate_tensors": true,
+            "cache_images": false,
+            "empty_cache": true
+        },
+        "cuda": {
+            "enable_memory_optimization": true,
+            "enable_async_execution": false,
+            "mixed_precision": false
+        },
+        "io": {
+            "parallel_loading": true,
+            "async_saving": false
+        }
+    },
+
+    "performance_monitoring": {
+        "track_fps": true,
+        "track_memory": true,
+        "track_throughput": true,
+        "log_interval": 10
+    }
+}

@@ -115,13 +115,8 @@ class IrViDataset(Dataset):
             ir_image = self.transform(ir_image_pil)
             vi_image = self.transform(vi_image_pil)
         
-        # 由于DenseFuse是自编码器，我们只需要返回一张图像作为训练目标
-        # 这里可以选择返回红外或可见光图像，或者它们的某种组合
-        # 为了训练融合网络，我们可以随机选择一个图像
-        if np.random.rand() > 0.5:
-            return ir_image
-        else:
-            return vi_image
+        # 阶段三训练需要返回红外和可见光图像对
+        return ir_image, vi_image
 
 
 def image_transform(resize=256, gray=True, augment=True):

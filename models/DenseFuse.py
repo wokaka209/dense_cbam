@@ -116,6 +116,72 @@ class DenseFuse_train(nn.Module):
         encoder_feature = self.encoder(x)
         out = self.decoder(encoder_feature)
         return out
+    
+    def freeze_backbone(self):
+        """冻结编码器和解码器的主干网络参数（不包括CBAM）"""
+        for param in self.encoder.conv.parameters():
+            param.requires_grad = False
+        for param in self.encoder.DenseBlock.parameters():
+            param.requires_grad = False
+        for param in self.decoder.parameters():
+            param.requires_grad = False
+    
+    def unfreeze_backbone(self):
+        """解冻编码器和解码器的主干网络参数"""
+        for param in self.encoder.conv.parameters():
+            param.requires_grad = True
+        for param in self.encoder.DenseBlock.parameters():
+            param.requires_grad = True
+        for param in self.decoder.parameters():
+            param.requires_grad = True
+    
+    def freeze_cbam(self):
+        """冻结CBAM模块参数"""
+        if self.encoder.use_attention:
+            for param in self.encoder.attention.parameters():
+                param.requires_grad = False
+    
+    def unfreeze_cbam(self):
+        """解冻CBAM模块参数"""
+        if self.encoder.use_attention:
+            for param in self.encoder.attention.parameters():
+                param.requires_grad = True
+    
+    def freeze_decoder(self):
+        """冻结解码器参数"""
+        for param in self.decoder.parameters():
+            param.requires_grad = False
+    
+    def unfreeze_decoder(self):
+        """解冻解码器参数"""
+        for param in self.decoder.parameters():
+            param.requires_grad = True
+    
+    def get_trainable_params(self):
+        """获取所有可训练参数"""
+        return [p for p in self.parameters() if p.requires_grad]
+    
+    def get_backbone_params(self):
+        """获取主干网络参数（不包括CBAM）"""
+        params = []
+        params.extend(self.encoder.conv.parameters())
+        params.extend(self.encoder.DenseBlock.parameters())
+        params.extend(self.decoder.parameters())
+        return params
+    
+    def get_cbam_params(self):
+        """获取CBAM模块参数"""
+        if self.encoder.use_attention:
+            return list(self.encoder.attention.parameters())
+        return []
+    
+    def get_encoder_params(self):
+        """获取编码器参数"""
+        return list(self.encoder.parameters())
+    
+    def get_decoder_params(self):
+        """获取解码器参数"""
+        return list(self.decoder.parameters())
 
 
 def initialize_weights(model):

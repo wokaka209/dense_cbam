@@ -331,6 +331,160 @@ Epoch [2/80]: 100%|██████████| 500/500 [04:55<00:00, loss=0.
 tensorboard --logdir=./runs/train_XX-XX_XX-XX/logs
 ```
 
+#### 三阶段训练（进阶版）
+
+`run_train.py` 实现了完整的三阶段训练流程，这是更高级的训练方案：
+
+##### 三阶段训练概述
+
+| 阶段 | 训练内容 | Epochs | 学习率 | 注意力机制 | 可训练参数 |
+|------|---------|--------|--------|-----------|-----------|
+| **阶段一** | 自编码器预训练 | 80 | 2e-4 | ❌ 不使用 | 全部参数 |
+| **阶段二** | CBAM微调 | 40 | 1e-4 | ✅ 使用 | 仅CBAM模块 |
+| **阶段三** | 端到端融合 | 60 | 1e-4 | ✅ 使用 | 全部/融合层 |
+
+##### 完整三阶段训练
+
+```bash
+python run_train.py --train_all_stages
+```
+
+**执行流程**：
+1. 阶段一：自编码器预训练（仅可见光图像）
+2. 阶段二：CBAM注意力机制微调（仅可见光图像）
+3. 阶段三：红外-可见光图像融合训练（红外+可见光对）
+
+##### 单阶段训练
+
+```bash
+# 训练阶段一
+python run_train.py --stage 1
+
+# 训练阶段二（需要阶段一模型）
+python run_train.py --stage 2 --resume_stage1 ./checkpoints/stage1/best.pth
+
+# 训练阶段三（需要阶段二模型）
+python run_train.py --stage 3 --resume_stage2 ./checkpoints/stage2/best.pth
+```
+
+##### 三阶段训练完整参数
+
+| 参数类别 | 参数名 | 默认值 | 说明 |
+|---------|--------|--------|------|
+| **阶段选择** | `--train_all_stages` | False | 执行完整三阶段训练 |
+|  | `--stage` | 1 | 指定训练阶段 (1/2/3) |
+| **数据集** | `--ir_path` | M3FD路径 | 红外图像路径 |
+|  | `--vi_path` | M3FD路径 | 可见光图像路径 |
+|  | `--gray` | False | 是否使用灰度模式 |
+| **阶段一** | `--stage1_epochs` | 80 | 训练轮数 |
+|  | `--stage1_lr` | 2e-4 | 学习率 |
+| **阶段二** | `--stage2_epochs` | 40 | 训练轮数 |
+|  | `--stage2_lr` | 1e-4 | 学习率 |
+|  | `--resume_stage1` | ./checkpoints/stage1/best.pth | 阶段一模型路径 |
+| **阶段三** | `--stage3_epochs` | 60 | 训练轮数 |
+|  | `--stage3_lr` | 1e-4 | 学习率 |
+|  | `--fusion_strategy` | l1_norm | 融合策略 |
+|  | `--end_to_end_finetune` | False | 是否端到端微调 |
+|  | `--resume_stage2` | ./checkpoints/stage2/best.pth | 阶段二模型路径 |
+| **优化** | `--warmup_epochs` | 5 | 学习率预热轮数 |
+|  | `--use_gradient_clipping` | True | 梯度裁剪 |
+|  | `--use_adaptive_weights` | True | 自适应权重 |
+|  | `--optimize_en_ag` | True | EN/AG优化模式 |
+|  | `--use_balanced_loss` | True | 平衡损失模式 |
+|  | `--use_lr_decay` | True | 学习率衰减 |
+| **损失函数权值** | `--manual_weights` | False | 使用手动设置的权值而非自适应权重 |
+|  | `--l1_weight` | 1.0 | L1损失权值 (范围: [0.0, 10.0]) |
+|  | `--ssim_weight` | 100.0 | SSIM损失权值 (范围: [0.0, 100.0]) |
+|  | `--grad_weight` | 5.0 | 梯度损失权值 (范围: [0.0, 10.0]) |
+|  | `--tv_weight` | 0.1 | TV损失权值 (范围: [0.0, 10.0]) |
+
+##### 损失函数权值参数说明
+
+**参数取值范围**：
+- 所有权值参数的取值范围为 `[0.0, 10.0]`（SSIM权重为 `[0.0, 100.0]`）
+- 设置为 `0.0` 表示禁用对应的损失项
+- 权值越大，该损失项在总损失中的占比越高
+
+**默认值（论文验证）**：
+- `--l1_weight`: 1.0（L1损失权值）
+- `--ssim_weight`: 100.0（SSIM损失权值，论文验证的有效值）
+- `--grad_weight`: 5.0（梯度损失权值）
+- `--tv_weight`: 0.1（TV损失权值）
+
+**使用方法**：
+
+1. **使用自适应权重（默认）**：
+   ```bash
+   python run_train.py --train_all_stages
+   ```
+   - 不需要指定 `--manual_weights` 参数
+   - 系统会根据训练阶段自动调整权重
+   - 适用于大多数场景
+
+2. **使用手动权重**：
+   ```bash
+   python run_train.py --train_all_stages --manual_weights \
+       --l1_weight 2.0 \
+       --ssim_weight 1.5 \
+       --grad_weight 0.2 \
+       --tv_weight 0.05
+   ```
+   - 必须指定 `--manual_weights` 参数
+   - 所有四个权值参数都需要明确设置
+   - 适用于需要精细控制损失函数权重的场景
+
+3. **仅使用部分损失项**：
+   ```bash
+   python run_train.py --train_all_stages --manual_weights \
+       --l1_weight 1.0 \
+       --ssim_weight 1.0 \
+       --grad_weight 0.0 \
+       --tv_weight 0.0
+   ```
+   - 将不需要的损失项权值设置为 `0.0`
+   - 示例中仅使用L1和SSIM损失
+
+**权值调整建议**：
+
+| 场景 | L1权重 | SSIM权重 | 梯度权重 | TV权重 | 说明 |
+|------|--------|----------|---------|--------|------|
+| 论文默认配置 | 1.0 | 100.0 | 5.0 | 0.1 | 论文验证的有效配置 |
+| 强调结构保持 | 0.5 | 100.0 | 5.0 | 0.1 | 提高SSIM权重，保持图像结构 |
+| 强调边缘细节 | 1.0 | 100.0 | 8.0 | 0.1 | 提高梯度权重，增强边缘 |
+| 强调平滑性 | 1.0 | 100.0 | 5.0 | 0.2 | 提高TV权重，减少噪声 |
+| 仅像素重建 | 1.0 | 0.0 | 0.0 | 0.0 | 仅使用L1损失，快速训练 |
+
+**注意事项**：
+- 手动权重适用于所有三个训练阶段
+- 使用手动权重时，`--use_adaptive_weights` 参数会被自动忽略
+- 权值设置过大会导致训练不稳定，建议从默认值开始逐步调整
+- 不同数据集可能需要不同的权值配置，建议通过实验确定最优参数
+
+##### 三阶段训练输出
+
+训练完成后，会在 `./runs` 目录下生成以下结构：
+
+```
+runs/
+├── stage1_autoencoder/
+│   ├── checkpoints/
+│   │   ├── epoch000-loss0.xxx.pth
+│   │   ├── best.pth
+│   │   └── stage1_final.pth
+│   └── logs/
+│       └── events.*
+├── stage2_cbam/
+│   └── ...
+└── stage3_fusion/
+    └── ...
+```
+
+##### 详细文档
+
+完整的训练说明、故障排除和高级配置，请参考：
+- [三阶段训练详细文档](docs/THREE_STAGE_TRAINING_DETAILED.md)
+- [训练流程图](docs/TRAINING_FLOWCHART.md)
+
 ### 4. 批量图像融合
 
 #### 标准版融合（run_fusion.py）

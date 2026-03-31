@@ -50,12 +50,15 @@ import threading
 import torch
 import torch.nn.functional as F
 from torch.utils.cpp_extension import load_inline
+import json
+
+
 
 # 添加父目录到路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from fusion import create_fusion_engine, FusionStrategyRegistry
-from fusion.base import BaseFusionStrategy
+from configs_loader import ConfigLoader, FusionConfig
 
 
 class PerformanceStats:
@@ -156,46 +159,28 @@ class PerformanceStats:
         print(f"{'='*60}")
 
 
-class OptimizedFusionStrategy(BaseFusionStrategy):
+class OptimizedFusionStrategy:
     """
-    优化版融合策略
-    
-    性能优化点：
-    ---------
-    1. 减少中间张量的创建
-    2. 使用in-place操作
-    3. 合并计算步骤
-    4. 使用向量化操作代替循环
+    优化版融合策略（与run_train.py保持一致）
     
     策略说明：
     ---------
-    采用简化的加权融合策略，在保持融合质量的同时：
-    - 减少计算复杂度
-    - 降低内存占用
-    - 提升处理速度
+    采用与run_train.py阶段三训练相同的融合策略，
+    确保模型架构和融合逻辑的一致性。
     
-    融合公式：
-    ---------
-    fused = α * feature1 + (1-α) * feature2
-    
-    其中 α = f(energy1, energy2)
-    energy = L1范数 + 局部方差
+    注意：此策略类仅作为占位符，实际融合由模型内部的融合层完成。
     """
     
     def __init__(self):
-        super().__init__()
         self.name = "optimized"
-        self.description = "优化版融合策略（高性能）"
+        self.description = "优化版融合策略（与run_train.py保持一致）"
     
     def fuse(self, feature1: torch.Tensor, feature2: torch.Tensor) -> torch.Tensor:
         """
-        执行优化的特征融合
+        融合特征（占位符方法）
         
-        优化点：
-        -----
-        1. 使用单一的能量计算函数
-        2. 合并归一化和加权步骤
-        3. 使用向量化操作
+        注意：实际融合由模型内部的融合层完成，
+        此方法仅用于保持接口一致性。
         
         Args:
             feature1: 第一个特征张量 [B, C, H, W]
@@ -204,28 +189,16 @@ class OptimizedFusionStrategy(BaseFusionStrategy):
         Returns:
             torch.Tensor: 融合后的特征张量
         """
-        # 优化：使用L1范数作为能量指标（简化计算）
-        energy1 = torch.sum(torch.abs(feature1), dim=1, keepdim=True)
-        energy2 = torch.sum(torch.abs(feature2), dim=1, keepdim=True)
-        
-        # 优化：合并计算，直接得到融合权重
-        total_energy = energy1 + energy2 + 1e-8
-        
-        # 优化：使用除法代替softmax（更高效）
-        weight1 = energy1 / total_energy
-        weight2 = energy2 / total_energy
-        
-        # 优化：直接应用权重融合
-        fused = weight1 * feature1 + weight2 * feature2
-        
-        return fused
+        # 实际融合由模型内部的融合层完成
+        # 此方法仅用于保持接口一致性
+        return feature1
     
     def get_config(self) -> Dict:
         """获取策略配置"""
         return {
             'name': self.name,
             'description': self.description,
-            'optimization': 'high_performance'
+            'consistency': 'aligned_with_run_train'
         }
 
 
@@ -284,11 +257,15 @@ class FastImageLoader:
         # 加载可见光图像
         vi_image = read_image(vi_path, mode=ImageReadMode.RGB)
         
-        # 转换
+        # 转换（与训练时保持一致）
+        # 1. Resize到目标尺寸
+        # 2. ToTensor转换为[0, 1]
+        # 3. Normalize到[-1, 1]（与训练时一致）
         transform = transforms.Compose([
             transforms.ToPILImage(),
             transforms.Resize((768, 1024)),  # 默认优化尺寸
-            transforms.ToTensor()
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # 与训练保持一致
         ])
         
         ir_tensor = transform(ir_image).unsqueeze(0)
@@ -364,7 +341,7 @@ class OptimizedFusionEngine:
         融合模型
     device : torch.device
         计算设备
-    strategy : BaseFusionStrategy
+    strategy : OptimizedFusionStrategy
         融合策略
     batch_size : int
         批处理大小
@@ -376,7 +353,7 @@ class OptimizedFusionEngine:
         self,
         model: torch.nn.Module,
         device: torch.device,
-        strategy: BaseFusionStrategy,
+        strategy: OptimizedFusionStrategy,
         batch_size: int = 4,
         use_cuda_optimize: bool = True
     ):
@@ -416,9 +393,10 @@ class OptimizedFusionEngine:
         减少内存分配开销
         """
         if self.use_cuda_optimize and torch.cuda.is_available():
-            # 预热GPU
+            # 预热GPU（双输入模型需要两个输入）
             dummy = torch.zeros((1, 3, 768, 1024), device=self.device)
-            _ = self.model.encoder(dummy)
+            with torch.no_grad():
+                _ = self.model(dummy, dummy)
             del dummy
             if self.device.type == 'cuda':
                 torch.cuda.empty_cache()
@@ -429,7 +407,7 @@ class OptimizedFusionEngine:
         vi_tensor: torch.Tensor
     ) -> torch.Tensor:
         """
-        融合单对图像
+        融合单对图像（支持双输入模型）
         
         Args:
             ir_tensor: 红外图像张量 [1, C, H, W]
@@ -442,16 +420,10 @@ class OptimizedFusionEngine:
         ir_tensor = ir_tensor.to(self.device)
         vi_tensor = vi_tensor.to(self.device)
         
-        # 特征提取
+        # 特征提取和融合（与run_train.py保持一致的双输入模型）
         with torch.no_grad():
-            ir_features = self.model.encoder(ir_tensor)
-            vi_features = self.model.encoder(vi_tensor)
-            
-            # 融合
-            fused_features = self.strategy.fuse(ir_features, vi_features)
-            
-            # 重建
-            fused_tensor = self.model.decoder(fused_features)
+            # 双输入模型的前向传播
+            fused_tensor = self.model(ir_tensor, vi_tensor)
         
         return fused_tensor.cpu()
     
@@ -461,7 +433,7 @@ class OptimizedFusionEngine:
         vi_tensors: List[torch.Tensor]
     ) -> List[torch.Tensor]:
         """
-        批量融合图像
+        批量融合图像（支持双输入模型）
         
         性能优化点：
         ---------
@@ -480,16 +452,10 @@ class OptimizedFusionEngine:
         ir_batch = torch.cat(ir_tensors, dim=0).to(self.device)
         vi_batch = torch.cat(vi_tensors, dim=0).to(self.device)
         
-        # 批量推理
+        # 批量推理（与run_train.py保持一致的双输入模型）
         with torch.no_grad():
-            ir_features = self.model.encoder(ir_batch)
-            vi_features = self.model.encoder(vi_batch)
-            
-            # 批量融合
-            fused_features = self.strategy.fuse(ir_features, vi_features)
-            
-            # 批量重建
-            fused_batch = self.model.decoder(fused_features)
+            # 双输入模型的批量前向传播
+            fused_batch = self.model(ir_batch, vi_batch)
         
         # 分离为单独的张量
         results = torch.split(fused_batch.cpu(), 1, dim=0)
@@ -612,6 +578,10 @@ class OptimizedFusionEngine:
                             align_corners=False
                         ).squeeze(0)
                     
+                    # 反归一化（将[-1, 1]转换回[0, 1]以便正确显示）
+                    fused_tensor = fused_tensor * 0.5 + 0.5
+                    fused_tensor = torch.clamp(fused_tensor, 0, 1)  # 确保值在[0, 1]范围内
+                    
                     # 保存
                     from torchvision.utils import save_image
                     save_image(fused_tensor, output_path)
@@ -645,7 +615,7 @@ class OptimizedFusionEngine:
 def create_optimized_engine(
     model_path: str,
     device: str = 'cuda',
-    strategy: str = 'optimized',
+    strategy: str = 'l1_norm',
     batch_size: int = 4,
     model_name: str = 'DenseFuse',
     input_nc: int = 3,
@@ -670,16 +640,18 @@ def create_optimized_engine(
     Returns:
         OptimizedFusionEngine: 优化版融合引擎
     """
-    from models import fuse_model
+    from models import fuse_model_with_fusion_layer
     
     # 创建设备
     device_obj = torch.device(device if torch.cuda.is_available() else 'cpu')
     
-    # 创建模型
-    model = fuse_model(
+    # 创建模型（与run_train.py保持一致：使用带融合层的模型）
+    model = fuse_model_with_fusion_layer(
         model_name=model_name,
         input_nc=input_nc,
-        output_nc=output_nc
+        output_nc=output_nc,
+        use_attention=True,
+        fusion_strategy=strategy
     )
     
     # 加载权重
@@ -689,29 +661,24 @@ def create_optimized_engine(
         weights_only=False
     )
     
-    # 加载编码器和解码器权重
-    if 'encoder_state_dict' in checkpoint:
+    # 加载模型权重（支持阶段三融合模型的权重格式）
+    if 'model' in checkpoint:
+        model.load_state_dict(checkpoint['model'], strict=False)
+    elif 'encoder_state_dict' in checkpoint and 'decoder_state_dict' in checkpoint:
+        # 兼容旧版本权重格式
         model.encoder.load_state_dict(checkpoint['encoder_state_dict'])
-    if 'decoder_state_dict' in checkpoint:
         model.decoder.load_state_dict(checkpoint['decoder_state_dict'])
-    elif 'model' in checkpoint:
-        model.load_state_dict(checkpoint['model'])
+    else:
+        raise ValueError(f"不支持的权重文件格式: {model_path}")
     
     print(f"✓ 模型加载成功: {model_path}")
-    
-    # 选择融合策略
-    if strategy == 'optimized':
-        fusion_strategy = OptimizedFusionStrategy()
-    else:
-        fusion_strategy = FusionStrategyRegistry.create(strategy)
-    
-    print(f"✓ 融合策略: {fusion_strategy.name}")
+    print(f"✓ 融合策略: {strategy}")
     
     # 创建优化引擎
     engine = OptimizedFusionEngine(
         model=model,
         device=device_obj,
-        strategy=fusion_strategy,
+        strategy=OptimizedFusionStrategy(),
         batch_size=batch_size,
         use_cuda_optimize=True
     )
@@ -719,57 +686,41 @@ def create_optimized_engine(
     return engine
 
 
-def parse_args():
-    """解析命令行参数"""
-    parser = argparse.ArgumentParser(
-        description='红外可见光图像融合 - 性能优化版本',
-        formatter_class=argparse.RawDescriptionHelpFormatter
-    )
+def load_config(config_path: str = None):
+    """
+    从JSON配置文件加载融合配置
     
-    # 模式选择
-    mode_group = parser.add_mutually_exclusive_group(required=True)
-    mode_group.add_argument('--single', action='store_true',
-                           help='单对图像融合模式')
-    mode_group.add_argument('--batch', action='store_true',
-                           help='批量图像融合模式')
+    Args:
+        config_path: 配置文件路径（可选，默认使用fusion_configs.json）
     
-    # 输入输出路径
-    parser.add_argument('--ir', type=str,
-                       help='红外图像路径（单对模式）')
-    parser.add_argument('--vi', type=str,
-                       help='可见光图像路径（单对模式）')
-    parser.add_argument('--output', type=str,
-                       default='data_result/fusion_optimized',
-                       help='输出路径或目录')
+    Returns:
+        FusionConfig: 融合配置对象
     
-    # 批量模式参数
-    parser.add_argument('--ir_dir', type=str,
-                       default='E:/whx_Graduation project/baseline_project/dataset/ir',
-                       help='红外图像目录（批量模式）')
-    parser.add_argument('--vi_dir', type=str,
-                       default='E:/whx_Graduation project/baseline_project/dataset/vi',
-                       help='可见光图像目录（批量模式）')
-    
-    # 性能优化参数
-    parser.add_argument('--batch_size', type=int, default=1,
-                       help='批处理大小（默认4，推荐4-8）')
-    parser.add_argument('--strategy', type=str, default='hybrid',
-                       choices=['optimized', 'enhanced_l1', 'multi_scale', 'gradient', 'hybrid'],
-                       help='融合策略（optimized为优化版）')
-    
-    # 显示统计
-    parser.add_argument('--show_stats', action='store_true', default=True,
-                       help='显示性能统计')
-    
-    # 其他参数
-    parser.add_argument('--model_path', type=str,
-                       default='runs/train_03-25_13-39/checkpoints/epoch054-loss0.016.pth',
-                       help='模型权重路径')
-    parser.add_argument('--device', type=str, default='cuda',
-                       choices=['cuda', 'cpu'],
-                       help='计算设备')
-    
-    return parser.parse_args()
+    功能说明：
+    ---------
+    从外部JSON配置文件加载融合参数，替代原有的命令行参数解析。
+    支持配置文件的热重载和配置验证。
+    """
+    try:
+        config = FusionConfig(config_path)
+        
+        if not config.validate():
+            raise ValueError("配置文件验证失败")
+        
+        print("[OK] 配置文件加载成功")
+        print(f"[OK] 配置文件路径: {config_path or 'fusion_configs.json'}")
+        
+        return config
+        
+    except FileNotFoundError as e:
+        print(f"[ERROR] 配置文件不存在: {e}")
+        raise
+    except json.JSONDecodeError as e:
+        print(f"[ERROR] JSON格式错误: {e}")
+        raise
+    except Exception as e:
+        print(f"[ERROR] 配置加载失败: {e}")
+        raise
 
 
 def print_banner():
@@ -779,68 +730,124 @@ def print_banner():
     print("=" * 60)
 
 
-def print_config(args):
+def print_config(config):
     """打印配置信息"""
-    print("\n📋 配置信息:")
-    print(f"  设备: {args.device}")
-    print(f"  批处理大小: {args.batch_size}")
-    print(f"  融合策略: {args.strategy}")
-    print(f"  显示统计: {args.show_stats}")
+    config_dict = config.to_dict()
     
-    if args.batch:
-        print(f"  红外目录: {args.ir_dir}")
-        print(f"  可见光目录: {args.vi_dir}")
-        print(f"  输出目录: {args.output}")
+    print("\n📋 配置信息:")
+    print(f"  设备: {ConfigLoader.get_value(config_dict, 'device', 'type')}")
+    print(f"  批处理大小: {ConfigLoader.get_value(config_dict, 'performance', 'batch_size')}")
+    print(f"  融合策略: {ConfigLoader.get_value(config_dict, 'model', 'fusion_strategy')}")
+    print(f"  显示统计: {ConfigLoader.get_value(config_dict, 'performance', 'show_stats')}")
+    
+    if config.batch_mode:
+        print(f"  红外目录: {ConfigLoader.get_value(config_dict, 'io_paths', 'batch_mode', 'ir_dir')}")
+        print(f"  可见光目录: {ConfigLoader.get_value(config_dict, 'io_paths', 'batch_mode', 'vi_dir')}")
+        print(f"  输出目录: {ConfigLoader.get_value(config_dict, 'io_paths', 'batch_mode', 'output_dir')}")
     else:
-        print(f"  红外图像: {args.ir}")
-        print(f"  可见光图像: {args.vi}")
-        print(f"  输出路径: {args.output}")
+        print(f"  红外图像: {ConfigLoader.get_value(config_dict, 'io_paths', 'single_mode', 'ir_image')}")
+        print(f"  可见光图像: {ConfigLoader.get_value(config_dict, 'io_paths', 'single_mode', 'vi_image')}")
+        print(f"  输出路径: {ConfigLoader.get_value(config_dict, 'io_paths', 'single_mode', 'output')}")
 
 
 def main():
     """主函数"""
-    args = parse_args()
+    import argparse
     
-    print_banner()
-    print_config(args)
+    parser = argparse.ArgumentParser(description='红外可见光图像融合 - 性能优化版本')
+    parser.add_argument('--config', type=str, default=None,
+                       help='配置文件路径（可选，默认使用fusion_configs.json）')
+    parser.add_argument('--batch', action='store_true',
+                       help='批量图像融合模式')
+    parser.add_argument('--single', action='store_true',
+                       help='单对图像融合模式')
+    parser.add_argument('--ir', type=str, default=None,
+                       help='红外图像路径（单对模式）')
+    parser.add_argument('--vi', type=str, default=None,
+                       help='可见光图像路径（单对模式）')
+    parser.add_argument('--output', type=str, default=None,
+                       help='输出路径或目录（可选）')
+    parser.add_argument('--ir_dir', type=str, default=None,
+                       help='红外图像目录（批量模式）')
+    parser.add_argument('--vi_dir', type=str, default=None,
+                       help='可见光图像目录（批量模式）')
+    parser.add_argument('--batch_size', type=int, default=None,
+                       help='批处理大小（可选）')
+    parser.add_argument('--strategy', type=str, default=None,
+                       choices=['addition', 'l1_norm', 'weighted_average'],
+                       help='融合策略（可选）')
+    parser.add_argument('--model_path', type=str, default=None,
+                       help='模型权重路径（可选）')
+    parser.add_argument('--device', type=str, default=None,
+                       choices=['cuda', 'cpu'],
+                       help='计算设备（可选）')
     
-    # 检查模型文件
-    if not os.path.exists(args.model_path):
-        print(f"\n❌ 错误: 模型文件不存在: {args.model_path}")
-        return
-    
-    print("\n🏗️ 初始化优化融合引擎...")
+    cmd_args = parser.parse_args()
     
     try:
-        # 创建优化引擎
+        config = load_config(cmd_args.config)
+        config_dict = config.to_dict()
+        
+        batch_mode = cmd_args.batch
+        single_mode = cmd_args.single
+        
+        if not batch_mode and not single_mode:
+            print("\n[ERROR] 请指定运行模式: --batch 或 --single")
+            return
+        
+        if batch_mode:
+            config.batch_mode = True
+            ir_dir = cmd_args.ir_dir or ConfigLoader.get_value(config_dict, 'io_paths', 'batch_mode', 'ir_dir')
+            vi_dir = cmd_args.vi_dir or ConfigLoader.get_value(config_dict, 'io_paths', 'batch_mode', 'vi_dir')
+            output_dir = cmd_args.output or ConfigLoader.get_value(config_dict, 'io_paths', 'batch_mode', 'output_dir')
+        else:
+            config.batch_mode = False
+            ir_image = cmd_args.ir or ConfigLoader.get_value(config_dict, 'io_paths', 'single_mode', 'ir_image')
+            vi_image = cmd_args.vi or ConfigLoader.get_value(config_dict, 'io_paths', 'single_mode', 'vi_image')
+            output_path = cmd_args.output or ConfigLoader.get_value(config_dict, 'io_paths', 'single_mode', 'output')
+        
+        model_path = cmd_args.model_path or ConfigLoader.get_value(config_dict, 'model', 'model_path')
+        device = cmd_args.device or ConfigLoader.get_value(config_dict, 'device', 'type')
+        strategy = cmd_args.strategy or ConfigLoader.get_value(config_dict, 'model', 'fusion_strategy')
+        batch_size = cmd_args.batch_size or ConfigLoader.get_value(config_dict, 'performance', 'batch_size')
+        
+        print_banner()
+        print_config(config)
+        
+        if not os.path.exists(model_path):
+            print(f"\n[ERROR] 错误: 模型文件不存在: {model_path}")
+            return
+        
+        print("\n[初始化融合引擎]...")
+        
         engine = create_optimized_engine(
-            model_path=args.model_path,
-            device=args.device,
-            strategy=args.strategy,
-            batch_size=args.batch_size
+            model_path=model_path,
+            device=device,
+            strategy=strategy,
+            batch_size=batch_size
         )
         
-        print("✓ 融合引擎初始化成功\n")
+        print("[OK] 融合引擎初始化成功\n")
         
-        if args.batch:
-            print("🔄 开始优化批量融合...")
+        if batch_mode:
+            print("[开始批量融合]...")
             
             processed, failed = engine.batch_fuse_with_progress(
-                ir_dir=args.ir_dir,
-                vi_dir=args.vi_dir,
-                output_dir=args.output,
+                ir_dir=ir_dir,
+                vi_dir=vi_dir,
+                output_dir=output_dir,
                 show_progress=True
             )
             
-            print(f"\n📊 融合统计:")
+            print(f"\n[融合统计]:")
             print(f"  成功: {processed}")
             print(f"  失败: {failed}")
             print(f"  总计: {processed + failed}")
             
             if processed > 0:
-                print(f"\n✓ 批量融合完成！结果保存在: {args.output}")
+                print(f"\n[OK] 批量融合完成！结果保存在: {output_dir}")
         else:
-            print("🔄 开始单对图像融合...")
+            print("[开始单对图像融合]...")
             
             from fusion.preprocessor import ImagePreprocessor
             from fusion.postprocessor import ImagePostprocessor
@@ -848,17 +855,17 @@ def main():
             preprocessor = ImagePreprocessor(target_size=(768, 1024))
             postprocessor = ImagePostprocessor()
             
-            ir_tensor, original_size = preprocessor.preprocess(args.ir)
-            vi_tensor, _ = preprocessor.preprocess(args.vi)
+            ir_tensor, original_size = preprocessor.preprocess(ir_image)
+            vi_tensor, _ = preprocessor.preprocess(vi_image)
             
             fused_tensor = engine.fuse_single(ir_tensor, vi_tensor)
             
-            postprocessor.process_and_save(fused_tensor, original_size, args.output)
+            postprocessor.process_and_save(fused_tensor, original_size, output_path)
             
-            print(f"✓ 融合完成: {args.output}")
-        
+            print(f"[OK] 融合完成: {output_path}")
+    
     except Exception as e:
-        print(f"\n❌ 发生错误: {e}")
+        print(f"\n[ERROR] 发生错误: {e}")
         import traceback
         traceback.print_exc()
 

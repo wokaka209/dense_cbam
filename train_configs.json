@@ -1,0 +1,143 @@
+{
+    "description": "训练配置文件 - 包含阶段1、阶段2和阶段3的所有训练参数",
+    "version": "2.0",
+    "author": "wokaka209",
+    "date": "2026-03-31",
+
+    "dataset": {
+        "ir_path": "E:/whx_Graduation project/baseline_project/dataset/ir",
+        "vi_path": "E:/whx_Graduation project/baseline_project/dataset/vi",
+        "gray": false
+    },
+
+    "training": {
+        "device": "cuda",
+        "batch_size": 16,
+        "num_workers": 8,
+        "base_dir": "./runs"
+    },
+
+    "stage1": {
+        "name": "autoencoder_pretraining",
+        "description": "自编码器预训练（仅可见光图像，不使用CBAM）",
+        "epochs": 30,
+        "learning_rate": 1e-4,
+        "use_attention": false,
+        "trainable_params": "all",
+        "output_dir": "stage1_autoencoder",
+        "loss_config": {
+            "l1_loss": {
+                "enabled": true,
+                "weight": 1.0
+            },
+            "ssim_loss": {
+                "enabled": true,
+                "weight": 100.0
+            },
+            "gradient_loss": {
+                "enabled": false,
+                "weight": 0.0
+            },
+            "tv_loss": {
+                "enabled": false,
+                "weight": 0.0
+            }
+        }
+    },
+
+    "stage2": {
+        "name": "cbam_finetuning",
+        "description": "CBAM微调（仅可见光图像，冻结主干权重）",
+        "epochs": 40,
+        "learning_rate": 1e-4,
+        "use_attention": true,
+        "trainable_params": "cbam_only",
+        "output_dir": "stage2_cbam",
+        "resume_from_stage1": true,
+        "resume_stage1_path": "E:/whx_Graduation project/baseline_project/my_densefuse_advantive/runs/stage1_autoencoder/checkpoints/best.pth",
+        "loss_config": {
+            "l1_loss": {
+                "enabled": true,
+                "weight": 1.0
+            },
+            "ssim_loss": {
+                "enabled": true,
+                "weight": 100.0
+            },
+            "gradient_loss": {
+                "enabled": false,
+                "weight": 0.0
+            },
+            "tv_loss": {
+                "enabled": false,
+                "weight": 0.0
+            }
+        }
+    },
+
+    "stage3": {
+        "name": "fusion_training",
+        "description": "融合层训练（冻结Encoder，联合训练Decoder + Fusion Layer）",
+        "epochs": 50,
+        "learning_rate": 1e-4,
+        "use_attention": true,
+        "trainable_params": "decoder_and_fusion",
+        "output_dir": "stage3_fusion",
+        "resume_from_stage2": true,
+        "resume_stage2_path": "E:/whx_Graduation project/baseline_project/my_densefuse_advantive/runs/stage2_cbam/checkpoints/best.pth",
+        "fusion_config": {
+            "strategy": "l1_norm",
+            "available_strategies": [
+                "addition",
+                "l1_norm",
+                "weighted_average"
+            ]
+        },
+        "loss_config": {
+            "l1_loss": {
+                "enabled": true,
+                "weight": 1.0
+            },
+            "ssim_loss": {
+                "enabled": true,
+                "weight": 100.0
+            },
+            "gradient_loss": {
+                "enabled": true,
+                "weight": 5.0
+            },
+            "tv_loss": {
+                "enabled": true,
+                "weight": 0.1
+            }
+        }
+    },
+
+    "optimizer": {
+        "type": "AdamW",
+        "weight_decay": 1e-4,
+        "use_lr_decay": true,
+        "warmup_epochs": 5,
+        "use_gradient_clipping": true
+    },
+
+    "loss_function": {
+        "use_adaptive_weights": false,
+        "optimize_en_ag": true,
+        "use_balanced_loss": false,
+        "manual_weights_mode": true,
+        "weights": {
+            "l1_weight": 1.0,
+            "ssim_weight": 100.0,
+            "grad_weight": 5.0,
+            "tv_weight": 0.1
+        }
+    },
+
+    "model": {
+        "name": "DenseFuse",
+        "input_channels": 3,
+        "output_channels": 3,
+        "gray_mode": false
+    }
+}
