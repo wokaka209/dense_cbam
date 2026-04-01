@@ -77,11 +77,11 @@ class DenseBlock(torch.nn.Module):
         self.use_attention = use_attention
         if use_attention:
             try:
-                from .attention_modules import CBAM
+                from .attention_modules import ColorAwareCBAM
             except ImportError:
-                from attention_modules import CBAM
-            # DenseBlock输出64通道
-            self.attention = CBAM(in_channels=64, reduction=16, kernel_size=7)
+                from attention_modules import ColorAwareCBAM
+            # DenseBlock输出64通道，使用ColorAwareCBAM保护颜色特征
+            self.attention = ColorAwareCBAM(in_channels=64, reduction=None, kernel_size=7, color_preservation_weight=0.3)
 
     def forward(self, x):
         out = self.denseblock(x)
@@ -125,10 +125,10 @@ class Dense_Encoder(nn.Module):
         # 方案3：在Encoder末尾也添加注意力（多层次组合）
         if fusion_strategy == 3:
             try:
-                from .attention_modules import CBAM
+                from .attention_modules import ColorAwareCBAM
             except ImportError:
-                from attention_modules import CBAM
-            self.attention = CBAM(in_channels=64, reduction=16, kernel_size=7)
+                from attention_modules import ColorAwareCBAM
+            self.attention = ColorAwareCBAM(in_channels=64, reduction=None, kernel_size=7, color_preservation_weight=0.3)
         else:
             self.attention = None
 
@@ -170,11 +170,11 @@ class CNN_Decoder(nn.Module):
         # 方案2和方案3：在解码过程中添加注意力机制
         if fusion_strategy in [2, 3]:
             try:
-                from .attention_modules import CBAM
+                from .attention_modules import ColorAwareCBAM
             except ImportError:
-                from attention_modules import CBAM
-            self.attention1 = CBAM(in_channels=64, reduction=16, kernel_size=7)
-            self.attention2 = CBAM(in_channels=32, reduction=8, kernel_size=7)
+                from attention_modules import ColorAwareCBAM
+            self.attention1 = ColorAwareCBAM(in_channels=64, reduction=None, kernel_size=7, color_preservation_weight=0.3)
+            self.attention2 = ColorAwareCBAM(in_channels=32, reduction=None, kernel_size=7, color_preservation_weight=0.3)
         else:
             self.attention1 = None
             self.attention2 = None
