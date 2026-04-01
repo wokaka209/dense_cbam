@@ -13,14 +13,14 @@ from torchvision import transforms
 from torchvision.io import read_image, ImageReadMode
 from tqdm import tqdm
 import argparse
-from fusion_strategy.advanced_fusion import AdvancedFusionStrategy
+from fusion_strategy.advanced_fusion_optimized import AdvancedFusionStrategyOptimized
 
 
 class BatchImageFusionOptimized:
     def __init__(self, config):
         self.config = config
         self.target_size = (768, 1024)
-        self.fusion_strategy_obj = AdvancedFusionStrategy()
+        self.fusion_strategy_obj = AdvancedFusionStrategyOptimized()
         self.load_model()
 
     def load_model(self):
@@ -168,10 +168,10 @@ if __name__ == "__main__":
                         default='E:/whx_Graduation project/baseline_project/dataset/vi', 
                         help='可见光图像目录')
     parser.add_argument('--output_dir', type=str, 
-                        default='data_result/batch_fusion_optimized_001', 
+                        default='data_result/batch_fusion_optimized_cbam1-epoch30', 
                         help='输出目录')
     parser.add_argument('--model_weights', type=str, 
-                        default='', 
+                        default='runs/train_04-01_14-47/checkpoints/epoch023-loss4.941.pth', 
                         help='模型权重路径')
     parser.add_argument('--fusion_strategy', type=str, 
                         default='hybrid', 
