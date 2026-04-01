@@ -207,7 +207,7 @@ class AdvancedFusionStrategyOptimized:
         fusion3 = self.multi_scale_with_precomputed(feature1, feature2, features)
         
         # 步骤3：加权融合
-        fused_features = 0.9 * fusion1 + 0.1 * fusion2 + 0.1 * fusion3
+        fused_features = 0.9 * fusion1 + 0.2 * fusion2 + 0.05 * fusion3
         
         return fused_features
 
