@@ -1,36 +1,39 @@
 # -*- coding: utf-8 -*-
 """
 @file name:run_train.py
-@desc: 三阶段训练主程序入口 - 实现自编码器预训练、CBAM微调和融合层训练
+@desc: 两阶段训练主程序入口 - 实现自编码器预训练和CBAM微调
 @Writer: wokaka209
 @Date: 2026-03-31
 
 功能说明：
 ---------
-本脚本实现三阶段训练流程：
+本脚本实现两阶段训练流程：
 1. 阶段一：自编码器预训练（仅可见光图像，不使用CBAM，损失函数：L1 + SSIM）
-2. 阶段二：CBAM微调（仅可见光图像，冻结主干权重，损失函数：L1 + SSIM）
-3. 阶段三：融合层训练（红外+可见光图像对，冻结Encoder，联合训练Decoder + Fusion Layer，损失函数：L1 + SSIM + Gradient + TV）
+2. 阶段二：CBAM微调（红外+可见光图像对，冻结主干权重，损失函数：L1 + SSIM + Gradient + TV）
+
+注意：阶段三已禁用
+-----------------
+由于使用手动融合策略（addition, l1_norm, hybrid），融合层无参数需要训练，
+因此删除了阶段三的训练流程。推理时使用阶段二模型 + 手动融合策略即可。
 
 使用方法：
 ---------
-    # 完整三阶段训练
+    # 完整两阶段训练
     python run_train.py --train_all_stages
     
     # 单独训练某个阶段
     python run_train.py --stage 1
     python run_train.py --stage 2 --resume_stage1 ./checkpoints/stage1/best.pth
-    python run_train.py --stage 3 --resume_stage2 ./checkpoints/stage2/best.pth
     
     # 从配置加载训练
-    python run_train.py --config train_configs.json --stage 3
+    python run_train.py --config train_configs.json --stage 2
 
-融合策略配置：
+融合策略说明：
 -----------
-阶段三支持以下融合策略（在train_configs.json中配置）：
-- addition: 加法融合
-- l1_norm: L1范数加权融合（默认）
+推理时支持以下融合策略（在fusion_configs.json中配置）：
 - weighted_average: 加权平均融合
+- l1_norm: L1范数自适应融合
+- hybrid: 混合融合策略（推荐）
 
 损失函数配置：
 -----------
@@ -157,11 +160,10 @@ def print_config(config, train_stage: int = 1, train_all: bool = False):
     
     print("\n[训练阶段]:")
     if train_all:
-        print(f"  - 执行完整三阶段训练")
+        print(f"  - 执行完整两阶段训练")
         print(f"  - 阶段一: {ConfigLoader.get_value(config_dict, 'stage1', 'epochs')} epochs, lr={ConfigLoader.get_value(config_dict, 'stage1', 'learning_rate')}")
         print(f"  - 阶段二: {ConfigLoader.get_value(config_dict, 'stage2', 'epochs')} epochs, lr={ConfigLoader.get_value(config_dict, 'stage2', 'learning_rate')}")
-        print(f"  - 阶段三: {ConfigLoader.get_value(config_dict, 'stage3', 'epochs')} epochs, lr={ConfigLoader.get_value(config_dict, 'stage3', 'learning_rate')}")
-        print(f"  - 融合策略: {ConfigLoader.get_value(config_dict, 'stage3', 'fusion_config', 'strategy')}")
+        print(f"  - 阶段三: 已禁用（使用手动融合策略）")
     else:
         print(f"  - 当前阶段: {train_stage}")
         if train_stage == 1:
@@ -171,11 +173,6 @@ def print_config(config, train_stage: int = 1, train_all: bool = False):
             print(f"  - 训练轮数: {ConfigLoader.get_value(config_dict, 'stage2', 'epochs')}")
             print(f"  - 学习率: {ConfigLoader.get_value(config_dict, 'stage2', 'learning_rate')}")
             print(f"  - 恢复路径: {ConfigLoader.get_value(config_dict, 'stage2', 'resume_stage1_path')}")
-        elif train_stage == 3:
-            print(f"  - 训练轮数: {ConfigLoader.get_value(config_dict, 'stage3', 'epochs')}")
-            print(f"  - 学习率: {ConfigLoader.get_value(config_dict, 'stage3', 'learning_rate')}")
-            print(f"  - 融合策略: {ConfigLoader.get_value(config_dict, 'stage3', 'fusion_config', 'strategy')}")
-            print(f"  - 恢复路径: {ConfigLoader.get_value(config_dict, 'stage3', 'resume_stage2_path')}")
     
     print("\n[训练参数]:")
     print(f"  - 设备: {ConfigLoader.get_value(config_dict, 'training', 'device')}")
@@ -219,8 +216,10 @@ def train_stage1(config, resume_path: str = ''):
     config_dict = config.to_dict()
     
     base_dir = ConfigLoader.get_value(config_dict, 'training', 'base_dir', default='./runs')
+    ir_path = ConfigLoader.get_value(config_dict, 'dataset', 'ir_path')
     vi_path = ConfigLoader.get_value(config_dict, 'dataset', 'vi_path')
     gray = ConfigLoader.get_value(config_dict, 'dataset', 'gray', default=False)
+    resize = ConfigLoader.get_value(config_dict, 'dataset', 'resize', default=[256, 256])
     device = ConfigLoader.get_value(config_dict, 'training', 'device')
     batch_size = ConfigLoader.get_value(config_dict, 'training', 'batch_size')
     num_workers = ConfigLoader.get_value(config_dict, 'training', 'num_workers', default=8)
@@ -247,7 +246,7 @@ def train_stage1(config, resume_path: str = ''):
     print("\n[加载数据集]（阶段一：仅可见光图像）...")
     dataset = SingleImageDataset(
         image_path=vi_path,
-        transform=single_image_transform(gray=gray, augment=True),
+        transform=single_image_transform(resize=resize[0], gray=gray, augment=True),
         gray=gray
     )
     
@@ -397,7 +396,10 @@ def train_stage2(config, resume_stage1_path: str = '', resume_path: str = ''):
     
     base_dir = ConfigLoader.get_value(config_dict, 'training', 'base_dir', default='./runs')
     vi_path = ConfigLoader.get_value(config_dict, 'dataset', 'vi_path')
+    resize = ConfigLoader.get_value(config_dict, 'dataset', 'resize', default=[256, 256])
+    ir_path = ConfigLoader.get_value(config_dict, 'dataset', 'ir_path')
     gray = ConfigLoader.get_value(config_dict, 'dataset', 'gray', default=False)
+    
     device = ConfigLoader.get_value(config_dict, 'training', 'device')
     batch_size = ConfigLoader.get_value(config_dict, 'training', 'batch_size')
     num_workers = ConfigLoader.get_value(config_dict, 'training', 'num_workers', default=8)
@@ -421,10 +423,11 @@ def train_stage2(config, resume_stage1_path: str = '', resume_path: str = ''):
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
     
-    print("\n[加载数据集]（阶段二：仅可见光图像）...")
-    dataset = SingleImageDataset(
-        image_path=vi_path,
-        transform=single_image_transform(gray=gray, augment=True),
+    print("\n[加载数据集]（阶段二：红外+可见光图像对，CBAM微调）...")
+    dataset = IrViDataset(
+        ir_path=ir_path,
+        vi_path=vi_path,
+        transform=image_transform(resize=resize[0], gray=gray, augment=True),
         gray=gray
     )
     
@@ -436,12 +439,13 @@ def train_stage2(config, resume_stage1_path: str = '', resume_path: str = ''):
     )
     print(f"[OK] 数据集加载完成: {len(dataset)} 样本")
     
-    print("\n[初始化模型]（阶段二：含CBAM）...")
-    model = fuse_model(
+    print("\n[初始化模型]（阶段二：含CBAM，双输入）...")
+    model = fuse_model_with_fusion_layer(
         model_name="DenseFuse",
         input_nc=1 if gray else 3,
         output_nc=1 if gray else 3,
-        use_attention=True
+        use_attention=True,
+        fusion_strategy='addition'  # 阶段二使用简单的加法融合
     )
     model = model.to(device)
     
@@ -591,6 +595,7 @@ def train_stage3(config, resume_stage2_path: str = '', resume_path: str = ''):
     ir_path = ConfigLoader.get_value(config_dict, 'dataset', 'ir_path')
     vi_path = ConfigLoader.get_value(config_dict, 'dataset', 'vi_path')
     gray = ConfigLoader.get_value(config_dict, 'dataset', 'gray', default=False)
+    resize = ConfigLoader.get_value(config_dict, 'dataset', 'resize', default=[256, 256])
     device = ConfigLoader.get_value(config_dict, 'training', 'device')
     batch_size = ConfigLoader.get_value(config_dict, 'training', 'batch_size')
     num_workers = ConfigLoader.get_value(config_dict, 'training', 'num_workers', default=8)
@@ -616,7 +621,7 @@ def train_stage3(config, resume_stage2_path: str = '', resume_path: str = ''):
     dataset = IrViDataset(
         ir_path=ir_path,
         vi_path=vi_path,
-        transform=image_transform(gray=gray, augment=True),
+        transform=image_transform(resize=resize[0], gray=gray, augment=True),
         gray=gray
     )
     
@@ -763,17 +768,15 @@ def main():
     """主函数"""
     import argparse
     
-    parser = argparse.ArgumentParser(description='三阶段红外可见光图像融合训练')
+    parser = argparse.ArgumentParser(description='两阶段红外可见光图像融合训练')
     parser.add_argument('--train_all_stages', action='store_true', default=False,
-                       help='执行完整的三阶段训练')
-    parser.add_argument('--stage', type=int, choices=[1, 2, 3], default=1,
-                       help='选择训练阶段 (1: 自编码器预训练, 2: CBAM微调, 3: 融合层训练)')
+                       help='执行完整的两阶段训练')
+    parser.add_argument('--stage', type=int, choices=[1, 2], default=1,
+                       help='选择训练阶段 (1: 自编码器预训练, 2: CBAM微调)')
     parser.add_argument('--config', type=str, default=None,
                        help='配置文件路径（可选，默认使用train_configs.json）')
     parser.add_argument('--resume_stage1', type=str, default='',
                        help='阶段一模型路径（用于阶段二）')
-    parser.add_argument('--resume_stage2', type=str, default='',
-                       help='阶段二模型路径（用于阶段三）')
     parser.add_argument('--resume_path', type=str, default='',
                        help='恢复训练的模型路径（可选）')
     
@@ -799,19 +802,14 @@ def main():
                 print("\n[ERROR] 阶段二训练失败")
                 return
             
-            stage3_result = train_stage3(config, resume_stage2_path=stage2_result['model_path'])
-            if stage3_result is None:
-                print("\n[ERROR] 阶段三训练失败")
-                return
-            
             print("\n" + "=" * 60)
-            print("三阶段训练完成")
+            print("两阶段训练完成（阶段三已禁用）")
             print("=" * 60)
             print(f"[OK] 阶段一最佳损失: {stage1_result['best_loss']:.6f}")
             print(f"[OK] 阶段二最佳损失: {stage2_result['best_loss']:.6f}")
-            print(f"[OK] 阶段三最佳损失: {stage3_result['best_loss']:.6f}")
-            print(f"[OK] 总训练时间: {stage1_result['training_time'] + stage2_result['training_time'] + stage3_result['training_time']:.2f}秒")
-            print(f"[OK] 最终模型: {stage3_result['model_path']}")
+            print(f"[OK] 总训练时间: {stage1_result['training_time'] + stage2_result['training_time']:.2f}秒")
+            print(f"[OK] 最终模型: {stage2_result['model_path']}")
+            print(f"[INFO] 使用手动融合策略（hybrid/l1_norm/weighted_average）")
             print("=" * 60)
             
         else:
@@ -822,9 +820,10 @@ def main():
             elif args.stage == 2:
                 resume_stage1 = args.resume_stage1 if args.resume_stage1 else ''
                 result = train_stage2(config, resume_stage1_path=resume_stage1, resume_path=args.resume_path)
-            elif args.stage == 3:
-                resume_stage2 = args.resume_stage2 if args.resume_stage2 else ''
-                result = train_stage3(config, resume_stage2_path=resume_stage2, resume_path=args.resume_path)
+            else:
+                print("\n[ERROR] 阶段三已禁用（使用手动融合策略，无需训练）")
+                print("[INFO] 请使用阶段二的模型进行推理")
+                return
             
             if result is None:
                 print(f"\n[ERROR] 阶段 {args.stage} 训练失败")

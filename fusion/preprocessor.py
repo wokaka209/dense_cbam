@@ -88,7 +88,7 @@ class ImagePreprocessor:
     
     def __init__(
         self,
-        target_size: Tuple[int, int] = (1024, 1024),
+        target_size: Tuple[int, int] = (768, 1024),
         gray: bool = False,
         normalize: bool = False
     ):

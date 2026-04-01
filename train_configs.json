@@ -7,21 +7,22 @@
     "dataset": {
         "ir_path": "E:/whx_Graduation project/baseline_project/dataset/ir",
         "vi_path": "E:/whx_Graduation project/baseline_project/dataset/vi",
-        "gray": false
+        "gray": false,
+        "resize": [256, 256]
     },
 
     "training": {
         "device": "cuda",
         "batch_size": 16,
-        "num_workers": 8,
+        "num_workers": 4,
         "base_dir": "./runs"
     },
 
     "stage1": {
         "name": "autoencoder_pretraining",
         "description": "自编码器预训练（仅可见光图像，不使用CBAM）",
-        "epochs": 30,
-        "learning_rate": 1e-4,
+        "epochs": 35,
+        "learning_rate": 5e-4,
         "use_attention": false,
         "trainable_params": "all",
         "output_dir": "stage1_autoencoder",
@@ -47,9 +48,9 @@
 
     "stage2": {
         "name": "cbam_finetuning",
-        "description": "CBAM微调（仅可见光图像，冻结主干权重）",
+        "description": "CBAM微调（红外+可见光图像对，冻结主干权重，仅训练CBAM）",
         "epochs": 40,
-        "learning_rate": 1e-4,
+        "learning_rate": 3e-4,
         "use_attention": true,
         "trainable_params": "cbam_only",
         "output_dir": "stage2_cbam",
@@ -62,23 +63,24 @@
             },
             "ssim_loss": {
                 "enabled": true,
-                "weight": 100.0
+                "weight": 500.0
             },
             "gradient_loss": {
-                "enabled": false,
-                "weight": 0.0
+                "enabled": true,
+                "weight": 10.0
             },
             "tv_loss": {
-                "enabled": false,
-                "weight": 0.0
+                "enabled": true,
+                "weight": 0.5
             }
         }
     },
 
     "stage3": {
         "name": "fusion_training",
-        "description": "融合层训练（冻结Encoder，联合训练Decoder + Fusion Layer）",
-        "epochs": 50,
+        "description": "融合层训练（已禁用 - 使用手动融合策略，融合层无参数）",
+        "enabled": false,
+        "epochs": 0,
         "learning_rate": 1e-4,
         "use_attention": true,
         "trainable_params": "decoder_and_fusion",
@@ -100,7 +102,7 @@
             },
             "ssim_loss": {
                 "enabled": true,
-                "weight": 100.0
+                "weight": 1.0
             },
             "gradient_loss": {
                 "enabled": true,

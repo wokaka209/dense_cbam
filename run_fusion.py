@@ -161,26 +161,69 @@ class PerformanceStats:
 
 class OptimizedFusionStrategy:
     """
-    优化版融合策略（与run_train.py保持一致）
+    优化版融合策略（支持阶段二和阶段三）
     
     策略说明：
     ---------
-    采用与run_train.py阶段三训练相同的融合策略，
-    确保模型架构和融合逻辑的一致性。
+    - 阶段三：融合由模型内部的融合层完成
+    - 阶段二：使用配置的融合策略（weighted_average, l1_norm, hybrid等）
     
-    注意：此策略类仅作为占位符，实际融合由模型内部的融合层完成。
+    支持的融合策略：
+    ---------------
+    1. weighted_average: 加权平均融合
+    2. l1_norm: L1范数自适应融合
+    3. hybrid: 混合融合策略（结合多种策略优势）
+    
+    注意：此策略类根据配置选择不同的融合方式。
     """
     
-    def __init__(self):
+    def __init__(
+        self, 
+        use_fusion_layer: bool = True, 
+        fusion_weight: float = 0.5,
+        strategy_name: str = 'weighted_average'
+    ):
+        """
+        初始化融合策略
+        
+        Args:
+            use_fusion_layer: 是否使用融合层（阶段三为True）
+            fusion_weight: 融合权重（仅对weighted_average策略有效）
+            strategy_name: 融合策略名称（weighted_average, l1_norm, hybrid）
+        """
         self.name = "optimized"
-        self.description = "优化版融合策略（与run_train.py保持一致）"
+        self.description = "优化版融合策略"
+        self.use_fusion_layer = use_fusion_layer
+        self.fusion_weight = fusion_weight
+        self.strategy_name = strategy_name
+        
+        # 初始化具体的融合策略
+        self._init_strategy()
+    
+    def _init_strategy(self):
+        """初始化具体的融合策略"""
+        if self.use_fusion_layer:
+            # 阶段三：使用模型内部的融合层，不需要额外策略
+            self._strategy_impl = None
+        else:
+            # 阶段二：根据配置选择融合策略
+            if self.strategy_name == 'weighted_average':
+                self._strategy_impl = self._weighted_average_fuse
+            elif self.strategy_name == 'l1_norm':
+                self._strategy_impl = self._l1_norm_fuse
+            elif self.strategy_name == 'hybrid':
+                # 延迟导入，避免循环依赖
+                from fusion.strategies_optimized import HybridFusionStrategy
+                self._hybrid_strategy = HybridFusionStrategy()
+                self._strategy_impl = self._hybrid_fuse
+            else:
+                # 默认使用加权平均
+                print(f"[WARNING] 未知的融合策略: {self.strategy_name}，使用默认的加权平均策略")
+                self._strategy_impl = self._weighted_average_fuse
     
     def fuse(self, feature1: torch.Tensor, feature2: torch.Tensor) -> torch.Tensor:
         """
-        融合特征（占位符方法）
-        
-        注意：实际融合由模型内部的融合层完成，
-        此方法仅用于保持接口一致性。
+        融合特征
         
         Args:
             feature1: 第一个特征张量 [B, C, H, W]
@@ -189,17 +232,88 @@ class OptimizedFusionStrategy:
         Returns:
             torch.Tensor: 融合后的特征张量
         """
-        # 实际融合由模型内部的融合层完成
-        # 此方法仅用于保持接口一致性
-        return feature1
+        if self.use_fusion_layer:
+            # 阶段三：融合由模型内部的融合层完成
+            # 此方法仅用于保持接口一致性
+            return feature1
+        else:
+            # 阶段二：使用配置的融合策略
+            return self._strategy_impl(feature1, feature2)
+    
+    def _weighted_average_fuse(self, feature1: torch.Tensor, feature2: torch.Tensor) -> torch.Tensor:
+        """
+        加权平均融合
+        
+        Args:
+            feature1: 第一个特征张量
+            feature2: 第二个特征张量
+        
+        Returns:
+            torch.Tensor: 融合后的特征张量
+        """
+        return self.fusion_weight * feature1 + (1 - self.fusion_weight) * feature2
+    
+    def _l1_norm_fuse(self, feature1: torch.Tensor, feature2: torch.Tensor) -> torch.Tensor:
+        """
+        L1范数自适应融合
+        
+        根据特征的L1范数自适应计算融合权重
+        
+        Args:
+            feature1: 第一个特征张量
+            feature2: 第二个特征张量
+        
+        Returns:
+            torch.Tensor: 融合后的特征张量
+        """
+        # 计算L1范数
+        l1_norm1 = torch.sum(torch.abs(feature1), dim=1, keepdim=True)
+        l1_norm2 = torch.sum(torch.abs(feature2), dim=1, keepdim=True)
+        
+        # 计算自适应权重
+        total_norm = l1_norm1 + l1_norm2 + 1e-6
+        weight1 = l1_norm1 / total_norm
+        weight2 = l1_norm2 / total_norm
+        
+        # 融合
+        return weight1 * feature1 + weight2 * feature2
+    
+    def _hybrid_fuse(self, feature1: torch.Tensor, feature2: torch.Tensor) -> torch.Tensor:
+        """
+        混合融合策略
+        
+        结合增强L1和多尺度融合的优势
+        
+        Args:
+            feature1: 第一个特征张量
+            feature2: 第二个特征张量
+        
+        Returns:
+            torch.Tensor: 融合后的特征张量
+        """
+        try:
+            return self._hybrid_strategy.fuse(feature1, feature2)
+        except Exception as e:
+            # 错误处理：回退到L1范数融合
+            print(f"[WARNING] 混合融合失败: {e}，回退到L1范数融合")
+            return self._l1_norm_fuse(feature1, feature2)
     
     def get_config(self) -> Dict:
         """获取策略配置"""
-        return {
+        config = {
             'name': self.name,
             'description': self.description,
-            'consistency': 'aligned_with_run_train'
+            'use_fusion_layer': self.use_fusion_layer,
+            'strategy_name': self.strategy_name
         }
+        
+        if not self.use_fusion_layer:
+            if self.strategy_name == 'weighted_average':
+                config['fusion_weight'] = self.fusion_weight
+            elif self.strategy_name == 'hybrid':
+                config['hybrid_config'] = self._hybrid_strategy.get_config()
+        
+        return config
 
 
 class FastImageLoader:
@@ -407,7 +521,7 @@ class OptimizedFusionEngine:
         vi_tensor: torch.Tensor
     ) -> torch.Tensor:
         """
-        融合单对图像（支持双输入模型）
+        融合单对图像（支持双输入模型和单输入模型）
         
         Args:
             ir_tensor: 红外图像张量 [1, C, H, W]
@@ -420,10 +534,19 @@ class OptimizedFusionEngine:
         ir_tensor = ir_tensor.to(self.device)
         vi_tensor = vi_tensor.to(self.device)
         
-        # 特征提取和融合（与run_train.py保持一致的双输入模型）
         with torch.no_grad():
-            # 双输入模型的前向传播
-            fused_tensor = self.model(ir_tensor, vi_tensor)
+            if self.strategy.use_fusion_layer:
+                # 阶段三：双输入模型（带融合层）
+                fused_tensor = self.model(ir_tensor, vi_tensor)
+            else:
+                # 阶段二：单输入模型（不带融合层）
+                # 分别提取特征
+                ir_features = self.model.encoder(ir_tensor)
+                vi_features = self.model.encoder(vi_tensor)
+                # 手动融合
+                fused_features = self.strategy.fuse(ir_features, vi_features)
+                # 解码
+                fused_tensor = self.model.decoder(fused_features)
         
         return fused_tensor.cpu()
     
@@ -433,7 +556,7 @@ class OptimizedFusionEngine:
         vi_tensors: List[torch.Tensor]
     ) -> List[torch.Tensor]:
         """
-        批量融合图像（支持双输入模型）
+        批量融合图像（支持双输入模型和单输入模型）
         
         性能优化点：
         ---------
@@ -452,10 +575,19 @@ class OptimizedFusionEngine:
         ir_batch = torch.cat(ir_tensors, dim=0).to(self.device)
         vi_batch = torch.cat(vi_tensors, dim=0).to(self.device)
         
-        # 批量推理（与run_train.py保持一致的双输入模型）
         with torch.no_grad():
-            # 双输入模型的批量前向传播
-            fused_batch = self.model(ir_batch, vi_batch)
+            if self.strategy.use_fusion_layer:
+                # 阶段三：双输入模型的批量前向传播
+                fused_batch = self.model(ir_batch, vi_batch)
+            else:
+                # 阶段二：单输入模型的批量前向传播
+                # 分别提取特征
+                ir_features = self.model.encoder(ir_batch)
+                vi_features = self.model.encoder(vi_batch)
+                # 手动融合
+                fused_features = self.strategy.fuse(ir_features, vi_features)
+                # 解码
+                fused_batch = self.model.decoder(fused_features)
         
         # 分离为单独的张量
         results = torch.split(fused_batch.cpu(), 1, dim=0)
@@ -621,7 +753,10 @@ def create_optimized_engine(
     input_nc: int = 3,
     output_nc: int = 3,
     gray: bool = False,
-    target_size: Tuple[int, int] = (768, 1024)
+    target_size: Tuple[int, int] = (768, 1024),
+    use_fusion_layer: bool = True,
+    fusion_weight: float = 0.5,
+    strategy_name: str = 'weighted_average'
 ) -> OptimizedFusionEngine:
     """
     创建优化版融合引擎的工厂函数
@@ -629,30 +764,46 @@ def create_optimized_engine(
     Args:
         model_path: 模型权重文件路径
         device: 计算设备
-        strategy: 融合策略
+        strategy: 融合策略（用于模型内部融合层）
         batch_size: 批处理大小
         model_name: 模型名称
         input_nc: 输入通道数
         output_nc: 输出通道数
         gray: 是否使用灰度模式
         target_size: 目标尺寸
+        use_fusion_layer: 是否使用融合层（阶段三为True，阶段二为False）
+        fusion_weight: 融合权重（仅对weighted_average策略有效）
+        strategy_name: 融合策略名称（weighted_average, l1_norm, hybrid）
     
     Returns:
         OptimizedFusionEngine: 优化版融合引擎
     """
-    from models import fuse_model_with_fusion_layer
+    from models import fuse_model_with_fusion_layer, fuse_model
     
     # 创建设备
     device_obj = torch.device(device if torch.cuda.is_available() else 'cpu')
     
-    # 创建模型（与run_train.py保持一致：使用带融合层的模型）
-    model = fuse_model_with_fusion_layer(
-        model_name=model_name,
-        input_nc=input_nc,
-        output_nc=output_nc,
-        use_attention=True,
-        fusion_strategy=strategy
-    )
+    # 根据配置创建模型
+    if use_fusion_layer:
+        # 阶段三：使用带融合层的模型
+        model = fuse_model_with_fusion_layer(
+            model_name=model_name,
+            input_nc=input_nc,
+            output_nc=output_nc,
+            use_attention=True,
+            fusion_strategy=strategy
+        )
+        print(f"[OK] 创建带融合层的模型（阶段三）")
+    else:
+        # 阶段二：使用不带融合层的模型
+        model = fuse_model(
+            model_name=model_name,
+            input_nc=input_nc,
+            output_nc=output_nc,
+            use_attention=True
+        )
+        print(f"[OK] 创建不带融合层的模型（阶段二）")
+        print(f"[OK] 融合策略: {strategy_name}")
     
     # 加载权重
     checkpoint = torch.load(
@@ -661,7 +812,7 @@ def create_optimized_engine(
         weights_only=False
     )
     
-    # 加载模型权重（支持阶段三融合模型的权重格式）
+    # 加载模型权重
     if 'model' in checkpoint:
         model.load_state_dict(checkpoint['model'], strict=False)
     elif 'encoder_state_dict' in checkpoint and 'decoder_state_dict' in checkpoint:
@@ -671,14 +822,19 @@ def create_optimized_engine(
     else:
         raise ValueError(f"不支持的权重文件格式: {model_path}")
     
-    print(f"✓ 模型加载成功: {model_path}")
-    print(f"✓ 融合策略: {strategy}")
+    print(f"[OK] 模型加载成功: {model_path}")
+    if use_fusion_layer:
+        print(f"[OK] 融合策略: {strategy}")
     
     # 创建优化引擎
     engine = OptimizedFusionEngine(
         model=model,
         device=device_obj,
-        strategy=OptimizedFusionStrategy(),
+        strategy=OptimizedFusionStrategy(
+            use_fusion_layer=use_fusion_layer,
+            fusion_weight=fusion_weight,
+            strategy_name=strategy_name
+        ),
         batch_size=batch_size,
         use_cuda_optimize=True
     )
@@ -726,7 +882,7 @@ def load_config(config_path: str = None):
 def print_banner():
     """打印程序横幅"""
     print("=" * 60)
-    print("🚀 红外可见光图像融合 - 性能优化版本")
+    print(" 红外可见光图像融合 - 性能优化版本")
     print("=" * 60)
 
 
@@ -734,7 +890,7 @@ def print_config(config):
     """打印配置信息"""
     config_dict = config.to_dict()
     
-    print("\n📋 配置信息:")
+    print("\n[配置信息]:")
     print(f"  设备: {ConfigLoader.get_value(config_dict, 'device', 'type')}")
     print(f"  批处理大小: {ConfigLoader.get_value(config_dict, 'performance', 'batch_size')}")
     print(f"  融合策略: {ConfigLoader.get_value(config_dict, 'model', 'fusion_strategy')}")
@@ -811,6 +967,17 @@ def main():
         strategy = cmd_args.strategy or ConfigLoader.get_value(config_dict, 'model', 'fusion_strategy')
         batch_size = cmd_args.batch_size or ConfigLoader.get_value(config_dict, 'performance', 'batch_size')
         
+        # 读取融合配置
+        use_fusion_layer = ConfigLoader.get_value(config_dict, 'model', 'use_fusion_layer', default=True)
+        fusion_weight = ConfigLoader.get_value(config_dict, 'model', 'fusion_weight', default=0.5)
+        strategy_name = ConfigLoader.get_value(config_dict, 'model', 'strategy_name', default='weighted_average')
+        
+        # 验证策略名称
+        valid_strategies = ['weighted_average', 'l1_norm', 'hybrid']
+        if strategy_name not in valid_strategies:
+            print(f"[WARNING] 无效的策略名称: {strategy_name}，使用默认策略: weighted_average")
+            strategy_name = 'weighted_average'
+        
         print_banner()
         print_config(config)
         
@@ -824,7 +991,10 @@ def main():
             model_path=model_path,
             device=device,
             strategy=strategy,
-            batch_size=batch_size
+            batch_size=batch_size,
+            use_fusion_layer=use_fusion_layer,
+            fusion_weight=fusion_weight,
+            strategy_name=strategy_name
         )
         
         print("[OK] 融合引擎初始化成功\n")

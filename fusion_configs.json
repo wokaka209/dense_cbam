@@ -25,7 +25,14 @@
         "gray_mode": false,
         "target_size": [768, 1024],
         "use_attention": true,
-        "fusion_strategy": "l1_norm"
+        "use_fusion_layer": false,
+        "strategy_name": "hybrid",
+        "fusion_weight": 0.5,
+        "description": {
+            "use_fusion_layer": "是否使用融合层（阶段三为true，阶段二为false）",
+            "strategy_name": "特征融合策略名称（weighted_average, l1_norm, hybrid）",
+            "fusion_weight": "加权平均融合的权重（仅strategy_name=weighted_average时有效）"
+        }
     },
 
     "device": {
@@ -37,22 +44,44 @@
         "batch_size": 1,
         "recommended_batch_range": [4, 8],
         "show_stats": true,
-        "num_workers": 4,
+        "num_workers": 0,
         "enable_cuda_optimize": true,
         "enable_mixed_precision": false
     },
 
     "fusion_strategies": {
         "available": [
-            "addition",
+            "weighted_average",
             "l1_norm",
-            "weighted_average"
+            "hybrid"
         ],
-        "default": "l1_norm",
+        "default": "hybrid",
         "description": {
-            "addition": "加法融合策略",
-            "l1_norm": "L1范数加权融合",
-            "weighted_average": "加权平均融合"
+            "weighted_average": "加权平均融合策略 - 简单快速，适合实时应用",
+            "l1_norm": "L1范数自适应融合 - 根据特征强度自适应调整权重",
+            "hybrid": "混合融合策略 - 结合增强L1和多尺度融合的优势，效果最佳"
+        },
+        "performance": {
+            "weighted_average": {
+                "speed": "最快",
+                "quality": "中等",
+                "memory": "最低"
+            },
+            "l1_norm": {
+                "speed": "快",
+                "quality": "良好",
+                "memory": "中等"
+            },
+            "hybrid": {
+                "speed": "中等",
+                "quality": "最佳",
+                "memory": "较高"
+            }
+        },
+        "recommendations": {
+            "real_time": "weighted_average",
+            "balanced": "l1_norm",
+            "high_quality": "hybrid"
         }
     },
 

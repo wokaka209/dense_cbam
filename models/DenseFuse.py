@@ -98,7 +98,8 @@ class CNN_Decoder(nn.Module):
             ConvLayer(64, 64, kernel_size, stride),
             ConvLayer(64, 32, kernel_size, stride),
             ConvLayer(32, 16, kernel_size, stride),
-            ConvLayer(16, output_nc, kernel_size, stride, is_last=True)
+            ConvLayer(16, output_nc, kernel_size, stride, is_last=True),
+            nn.Tanh()
         )
 
     def forward(self, encoder_output):
