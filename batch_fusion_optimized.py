@@ -19,7 +19,7 @@ from fusion_strategy.advanced_fusion import AdvancedFusionStrategy
 class BatchImageFusionOptimized:
     def __init__(self, config):
         self.config = config
-        self.target_size = (1024, 1024)
+        self.target_size = (768, 1024)
         self.fusion_strategy_obj = AdvancedFusionStrategy()
         self.load_model()
 
@@ -168,10 +168,10 @@ if __name__ == "__main__":
                         default='E:/whx_Graduation project/baseline_project/dataset/vi', 
                         help='可见光图像目录')
     parser.add_argument('--output_dir', type=str, 
-                        default='data_result/batch_fusion_optimized_2', 
+                        default='data_result/batch_fusion_optimized_001', 
                         help='输出目录')
     parser.add_argument('--model_weights', type=str, 
-                        default='E:/whx_Graduation project/baseline_project/my_densefuse_advantive/runs/train_03-14_11-11/checkpoints/epoch055-loss1.630.pth', 
+                        default='', 
                         help='模型权重路径')
     parser.add_argument('--fusion_strategy', type=str, 
                         default='hybrid', 

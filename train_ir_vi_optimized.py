@@ -34,10 +34,11 @@ def parse_args():
     parser.add_argument('--num_epochs', type=int, default=80, help='number of epochs to train for（优化版：80）')
     parser.add_argument('--lr', type=float, default=2e-4, help='初始学习率（优化版：2e-4）')
     parser.add_argument('--resume_path', default='', type=str, help='导入已训练好的模型路径')
-    parser.add_argument('--num_workers', type=int, default=8, help='载入数据集所调用的cpu线程数')
+    parser.add_argument('--num_workers', type=int, default=4, help='载入数据集所调用的cpu线程数')
     
     # 优化参数
-    parser.add_argument('--use_attention', action='store_true', default=True, help='是否使用注意力机制')
+    parser.add_argument('--fusion_strategy', type=int, default=1, choices=[1, 2, 3], 
+                        help='融合方案选择: 1=DenseBlock内部实时引导(推荐IVIF), 2=Decoder中特征选择(高质量), 3=多层次组合(最佳质量)')
     parser.add_argument('--use_mixed_precision', action='store_true', default=True, help='是否使用混合精度训练')
     parser.add_argument('--warmup_epochs', type=int, default=5, help='学习率预热epoch数')
     
@@ -62,8 +63,14 @@ def parse_args():
         print(f'resume_path: {args.resume_path}')
         
         print("----------优化选项----------")
-        print(f'use_attention: {args.use_attention}')
-        print(f'use_mixed_precision: {args.use_attention}')
+        print(f'fusion_strategy: {args.fusion_strategy}')
+        if args.fusion_strategy == 1:
+            print('  └─ 方案1：DenseBlock内部实时引导融合（推荐IVIF任务）')
+        elif args.fusion_strategy == 2:
+            print('  └─ 方案2：Decoder中解码特征选择（高质量融合需求）')
+        elif args.fusion_strategy == 3:
+            print('  └─ 方案3：多层次组合全方位增强（最佳融合质量）')
+        print(f'use_mixed_precision: {args.use_mixed_precision}')
         print(f'warmup_epochs: {args.warmup_epochs}')
     return args
 
@@ -145,12 +152,17 @@ if __name__ == "__main__":
     print("设备就绪...")
     
     # ----------------------------------------------------#
-    #           网络模型（启用注意力机制）
+    #           网络模型（支持三种融合方案）
     # ----------------------------------------------------#
     model_name = "DenseFuse"
     in_channel = 1 if args.gray else 3
     out_channel = 1 if args.gray else 3
-    model_train = fuse_model(model_name, input_nc=in_channel, output_nc=out_channel, use_attention=args.use_attention)
+    model_train = fuse_model(
+        model_name, 
+        input_nc=in_channel, 
+        output_nc=out_channel, 
+        fusion_strategy=args.fusion_strategy
+    )
     model_train.to(device)
     print(f'模型参数量: {sum(p.numel() for p in model_train.parameters()):,}')
 
@@ -181,8 +193,8 @@ if __name__ == "__main__":
     # 余弦退火调度器（在预热后使用）
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, 
-        T_0=20,  # 周期长度
-        T_mult=2,  # 周期倍增
+        T_0=40,  # 周期长度
+        T_mult=1,  # 周期倍增
         eta_min=1e-6  # 最小学习率
     )
 
