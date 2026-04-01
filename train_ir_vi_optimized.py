@@ -18,6 +18,57 @@ from models import fuse_model
 from utils.util_device import device_on
 from torch.utils.tensorboard import SummaryWriter
 import torch
+import glob
+import shutil
+
+
+def cleanup_old_checkpoints(checkpoint_dir, keep_best=True, keep_last=True):
+    """
+    清理旧的checkpoint文件，只保留best.pth和last.pth
+    
+    Args:
+        checkpoint_dir: checkpoint保存目录
+        keep_best: 是否保留best.pth
+        keep_last: 是否保留last.pth
+    
+    功能：
+        - 删除所有epoch*.pth格式的旧文件
+        - 保留best.pth（最佳模型）
+        - 保留last.pth（最新模型）
+        - 处理文件权限和不存在的情况
+    """
+    if not os.path.exists(checkpoint_dir):
+        return
+    
+    # 要保留的文件列表
+    files_to_keep = []
+    if keep_best:
+        files_to_keep.append('best.pth')
+    if keep_last:
+        files_to_keep.append('last.pth')
+    
+    # 获取所有.pth文件
+    all_pth_files = glob.glob(os.path.join(checkpoint_dir, '*.pth'))
+    
+    deleted_count = 0
+    for filepath in all_pth_files:
+        filename = os.path.basename(filepath)
+        
+        # 跳过要保留的文件
+        if filename in files_to_keep:
+            continue
+        
+        # 删除所有其他.pth文件（包括epoch*.pth和其他文件）
+        try:
+            os.remove(filepath)
+            deleted_count += 1
+        except PermissionError:
+            print(f'Warning: 文件权限不足，无法删除: {filename}')
+        except OSError as e:
+            print(f'Warning: 删除文件失败: {filename}, 错误: {e}')
+    
+    if deleted_count > 0:
+        print(f'[Cleanup] 已清理 {deleted_count} 个旧checkpoint文件')
 
 
 def parse_args():
@@ -262,6 +313,16 @@ if __name__ == "__main__":
     print('网络模型及优化器构建完成...')
     print('='*60)
     
+    # 训练开始前清理旧checkpoint文件
+    print('='*60)
+    print('【Checkpoint管理】')
+    print('='*60)
+    print(f'Checkpoint目录: {checkpoint_dir}')
+    print('✓ 保存策略：每个epoch保存last.pth，loss改进时保存best.pth')
+    print('✓ 自动清理：每个epoch清理旧epoch*.pth文件')
+    cleanup_old_checkpoints(checkpoint_dir)
+    print('='*60)
+    
     start_time = time.time()
     
     # 训练循环
@@ -355,27 +416,41 @@ if __name__ == "__main__":
         writer.add_scalar('ssim_weight', ssim_weight, global_step=epoch)
         
         # =====================checkpoint=======================
+        # 确保checkpoint目录存在
+        if not os.path.exists(checkpoint_dir):
+            os.makedirs(checkpoint_dir)
+        
+        # 准备checkpoint数据
+        checkpoint = {
+            'epoch': epoch,
+            'model': model_train.state_dict(),
+            'encoder_state_dict': model_train.encoder.state_dict(),
+            'decoder_state_dict': model_train.decoder.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'lr': lr_scheduler.state_dict(),
+            'best_loss': best_loss,
+        }
+        
+        # 保存last.pth（每个epoch都保存）
+        last_save_path = os.path.join(checkpoint_dir, 'last.pth')
+        torch.save(checkpoint, last_save_path)
+        
+        # 如果loss改进，保存best.pth
         if train_loss["total_loss"] < best_loss:
             best_loss = train_loss["total_loss"]
-            # 保存当前最佳模型
-            if not os.path.exists(checkpoint_dir):
-                os.makedirs(checkpoint_dir)
-            checkpoint = {
-                'epoch': epoch,
-                'model': model_train.state_dict(),
-                'encoder_state_dict': model_train.encoder.state_dict(),
-                'decoder_state_dict': model_train.decoder.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'lr': lr_scheduler.state_dict(),
-                'best_loss': best_loss,
-            }
-            checkpoint_name = f'epoch{epoch:03d}-loss{best_loss:.3f}.pth'
-            save_path = os.path.join(checkpoint_dir, checkpoint_name)
-            torch.save(checkpoint, save_path)
-            print(f'保存checkpoint: {checkpoint_name}')
+            checkpoint['best_loss'] = best_loss
+            best_save_path = os.path.join(checkpoint_dir, 'best.pth')
+            torch.save(checkpoint, best_save_path)
+            print(f'✓ 保存最佳模型: best.pth (loss: {best_loss:.6f})')
+        
+        # 清理旧的epoch*.pth文件（只保留best.pth和last.pth）
+        cleanup_old_checkpoints(checkpoint_dir)
 
     writer.close()
     end_time = time.time()
+    
+    # 训练结束前进行最终清理
+    cleanup_old_checkpoints(checkpoint_dir)
     
     print('='*60)
     print('训练完成！')
@@ -383,6 +458,18 @@ if __name__ == "__main__":
     print(f'训练耗时：{end_time - start_time:.2f}秒')
     print(f'训练epoch数：{num_epochs - init_epoch}')
     print(f'Best loss: {best_loss:.6f}')
+    print()
+    print('【最终Checkpoint文件】')
+    if os.path.exists(os.path.join(checkpoint_dir, 'best.pth')):
+        print(f'  ✓ best.pth - 最佳模型 (loss: {best_loss:.6f})')
+    else:
+        print(f'  ✗ best.pth - 未生成')
+    if os.path.exists(os.path.join(checkpoint_dir, 'last.pth')):
+        last_info = torch.load(os.path.join(checkpoint_dir, 'last.pth'), map_location='cpu')
+        print(f'  ✓ last.pth - 最新模型 (epoch: {last_info["epoch"]}, loss: {last_info["best_loss"]:.6f})')
+    else:
+        print(f'  ✗ last.pth - 未生成')
+    print()
     
     if init_epoch > 0:
         print(f'继续训练模式：从epoch {init_epoch} 训练到epoch {num_epochs}')
