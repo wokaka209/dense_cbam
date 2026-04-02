@@ -139,13 +139,13 @@ def plot_loss_curve(
     plt.figure(figsize=figure_size)
     
     if len(set(tags)) == 1:
-        plt.plot(steps, values, marker='o', markersize=2, linewidth=1.5, label=tags[0])
+        plt.plot(steps, values, marker='o', markersize=2, linewidth=2.5, label=tags[0])
     else:
         unique_tags = list(set(tags))
         for tag in unique_tags:
             tag_steps = [steps[i] for i in range(len(steps)) if tags[i] == tag]
             tag_values = [values[i] for i in range(len(values)) if tags[i] == tag]
-            plt.plot(tag_steps, tag_values, marker='o', markersize=2, linewidth=1.5, label=tag)
+            plt.plot(tag_steps, tag_values, marker='o', markersize=2, linewidth=2.5, label=tag)
     
     plt.title(title, fontsize=16, fontweight='bold')
     plt.xlabel(xlabel, fontsize=14)
@@ -196,7 +196,7 @@ def plot_multiple_loss_curves(
         steps = [d[0] for d in data]
         values = [d[1] for d in data]
         color = colors[idx % len(colors)]
-        plt.plot(steps, values, marker='o', markersize=2, linewidth=1.5, 
+        plt.plot(steps, values, marker='o', markersize=2, linewidth=2.5, 
                  label=tag, color=color)
     
     plt.title(title, fontsize=16, fontweight='bold')
@@ -255,27 +255,58 @@ def analyze_event_file(
     print(f"正在读取事件文件: {event_file}")
     loss_data = read_tensorboard_events(event_file)
     
-    print(f"发现 {len(loss_data)} 个标量标签")
-    for tag in loss_data.keys():
-        if 'loss' in tag.lower() or 'Loss' in tag:
-            print(f"  - {tag}: {len(loss_data[tag])} 个数据点")
+    # 过滤数据，仅保留loss相关曲线
+    filtered_loss_data = {}
+    for tag, data in loss_data.items():
+        if 'loss' in tag.lower() and 'learning_rate' not in tag.lower() and 'weight' not in tag.lower():
+            filtered_loss_data[tag] = data
+    
+    # 如果没有找到loss数据，使用所有数据
+    if not filtered_loss_data:
+        filtered_loss_data = loss_data
+    
+    print(f"发现 {len(loss_data)} 个标量标签，过滤后保留 {len(filtered_loss_data)} 个loss相关标签")
+    for tag in filtered_loss_data.keys():
+        print(f"  - {tag}: {len(filtered_loss_data[tag])} 个数据点")
     
     save_path = os.path.join(output_dir, output_name)
-    plot_multiple_loss_curves(loss_data, save_path=save_path)
+    plot_multiple_loss_curves(filtered_loss_data, save_path=save_path)
     
-    return loss_data
+    return filtered_loss_data
 
 
 def main():
     """
     主函数 - 读取TensorBoard事件文件并绘制loss曲线
     """
-    event_file = r"e:\whx_Graduation project\baseline_project\my_densefuse_advantive\runs\train_04-01_14-47\logs_RGB_epoch=80\events.out.tfevents.1775026052.coolkey.8864.0"
-    output_dir = r"e:\whx_Graduation project\baseline_project\my_densefuse_advantive\tools\analyze_loss\image"
+    # 使用跨平台路径处理
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(os.path.dirname(base_dir))
     
+    # 事件文件路径（可根据需要修改）
+    event_file = os.path.join(project_root, "runs", "train_04-01_14-47", "logs_RGB_epoch=80", "events.out.tfevents.1775026052.coolkey.8864.0")
+    
+    # 确保输出目录存在
+    output_dir = os.path.join(base_dir, "image")
     ensure_directory(output_dir)
     
-    analyze_event_file(event_file, output_dir, "loss_curve.png")
+    # 生成基于事件文件名的图片名称
+    event_filename = os.path.basename(event_file)
+    timestamp = event_filename.split('.')[2] if '.' in event_filename else "unknown"
+    output_name = f"loss_curve_{timestamp}.png"
+    
+    print(f"项目根目录: {project_root}")
+    print(f"事件文件: {event_file}")
+    print(f"输出目录: {output_dir}")
+    print(f"输出文件名: {output_name}")
+    
+    # 验证事件文件是否存在
+    if not os.path.exists(event_file):
+        print(f"错误：事件文件不存在: {event_file}")
+        print("请检查文件路径是否正确")
+        return
+    
+    analyze_event_file(event_file, output_dir, output_name)
 
 
 if __name__ == "__main__":

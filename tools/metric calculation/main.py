@@ -369,8 +369,8 @@ def main():
         save_interval=1000
     )
     
-    model_name = "dense_l1norm"
-    fus_root = "E:/whx_Graduation project/baseline_project/DenseFuse_2019/data_result/batch_fusion_l1norm_pro"
+    model_name = "dense_cbam2_epoch30"
+    fus_root = "data_result/batch_fusion_optimized_cbam2-epoch30"
     vi_root = "E:/whx_Graduation project/baseline_project/dataset/vi"
     ir_root = "E:/whx_Graduation project/baseline_project/dataset/ir"
     output_root = os.path.abspath("./tools/metric calculation/iqa_results")

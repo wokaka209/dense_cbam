@@ -26,16 +26,37 @@ class BatchImageFusionOptimized:
     def load_model(self):
         in_channel = 1 if self.config.gray else 3
         out_channel = 1 if self.config.gray else 3
-        self.model = fuse_model(self.config.model_name,
-                                input_nc=in_channel,
-                                output_nc=out_channel)
-        self.model = self.model.to(self.config.device)
+        
+        # 从权重文件中读取训练时使用的融合方案
         checkpoint = torch.load(self.config.resume_path,
                                 map_location=self.config.device, weights_only=False)
-        self.model.encoder.load_state_dict(checkpoint['encoder_state_dict'])
-        self.model.decoder.load_state_dict(checkpoint['decoder_state_dict'])
+        
+        # 检查权重文件中是否保存了融合方案信息
+        fusion_strategy = 1  # 默认使用方案3（最佳质量）
+        if 'fusion_strategy' in checkpoint:
+            fusion_strategy = checkpoint['fusion_strategy']
+            print(f'✓ 从权重文件读取融合方案: {fusion_strategy}')
+        else:
+            print(f'⚠️ 权重文件未保存融合方案信息，使用默认方案: {fusion_strategy}')
+        
+        # 使用与训练时相同的融合方案创建模型
+        self.model = fuse_model(self.config.model_name,
+                                input_nc=in_channel,
+                                output_nc=out_channel,
+                                fusion_strategy=fusion_strategy)
+        self.model = self.model.to(self.config.device)
+        
+        # 使用strict=False处理权重不匹配（如缺少注意力权重）
+        self.model.encoder.load_state_dict(checkpoint['encoder_state_dict'], strict=False)
+        self.model.decoder.load_state_dict(checkpoint['decoder_state_dict'], strict=False)
         print(f'✓ 模型加载成功: {self.config.resume_path}')
-        print(f'✓ 使用融合策略: {self.config.fusion_strategy}')
+        print(f'✓ 使用融合方案: {fusion_strategy}')
+        if fusion_strategy == 1:
+            print('  └─ 方案1：DenseBlock内部实时引导融合（推荐IVIF任务）')
+        elif fusion_strategy == 2:
+            print('  └─ 方案2：Decoder中特征选择（高质量融合需求）')
+        elif fusion_strategy == 3:
+            print('  └─ 方案3：多层次组合全方位增强（最佳融合质量）')
 
     def preprocess_image(self, image_path):
         image = read_image(image_path,
@@ -140,13 +161,13 @@ class BatchImageFusionOptimized:
         return processed_count, failed_count
 
 
-def batch_fusion_main(ir_dir, vi_dir, output_dir, model_weights, fusion_strategy='hybrid'):
+def batch_fusion_main(ir_dir, vi_dir, output_dir, model_weights, fusion_algorithm='hybrid'):
     class Config:
         def __init__(self):
             self.ir_path = ir_dir
             self.vi_path = vi_dir
             self.resume_path = model_weights
-            self.fusion_strategy = fusion_strategy
+            self.fusion_algorithm = fusion_algorithm  # 改为融合算法
             self.gray = False
             self.model_name = 'DenseFuse'
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -154,7 +175,7 @@ def batch_fusion_main(ir_dir, vi_dir, output_dir, model_weights, fusion_strategy
     config = Config()
     fusion_model = BatchImageFusionOptimized(config)
     
-    processed, failed = fusion_model.batch_fusion(ir_dir, vi_dir, output_dir, fusion_strategy)
+    processed, failed = fusion_model.batch_fusion(ir_dir, vi_dir, output_dir, fusion_algorithm)
     
     return processed, failed
 
@@ -168,15 +189,15 @@ if __name__ == "__main__":
                         default='E:/whx_Graduation project/baseline_project/dataset/vi', 
                         help='可见光图像目录')
     parser.add_argument('--output_dir', type=str, 
-                        default='data_result/batch_fusion_optimized_cbam1-epoch30', 
+                        default='data_result/batch_fusion_optimized_colorcbam1-epoch30', 
                         help='输出目录')
     parser.add_argument('--model_weights', type=str, 
-                        default='runs/train_04-01_14-47/checkpoints/epoch023-loss4.941.pth', 
+                        default='runs/train_04-02_16-05/checkpoints/best.pth', 
                         help='模型权重路径')
-    parser.add_argument('--fusion_strategy', type=str, 
+    parser.add_argument('--fusion_algorithm', type=str, 
                         default='hybrid', 
                         choices=['enhanced_l1', 'multi_scale', 'gradient', 'hybrid'],
-                        help='融合策略（推荐使用hybrid）')
+                        help='融合算法选择（推荐使用hybrid）')
     
     args = parser.parse_args()
     
@@ -187,8 +208,8 @@ if __name__ == "__main__":
     print(f"可见光图像目录: {args.vi_dir}")
     print(f"输出目录: {args.output_dir}")
     print(f"模型权重: {args.model_weights}")
-    print(f"融合策略: {args.fusion_strategy}")
+    print(f"融合算法: {args.fusion_algorithm}")
     print("="*60)
     
     batch_fusion_main(args.ir_dir, args.vi_dir, args.output_dir, 
-                    args.model_weights, args.fusion_strategy)
+                    args.model_weights, args.fusion_algorithm)

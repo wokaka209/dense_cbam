@@ -88,7 +88,7 @@ def parse_args():
     parser.add_argument('--num_workers', type=int, default=4, help='载入数据集所调用的cpu线程数')
     
     # 优化参数
-    parser.add_argument('--fusion_strategy', type=int, default=2, choices=[1, 2, 3], 
+    parser.add_argument('--fusion_strategy', type=int, default=1, choices=[1, 2, 3], 
                         help='融合方案选择: 1=DenseBlock内部实时引导(推荐IVIF), 2=Decoder中特征选择(高质量), 3=多层次组合(最佳质量)')
     parser.add_argument('--use_mixed_precision', action='store_true', default=True, help='是否使用混合精度训练')
     parser.add_argument('--warmup_epochs', type=int, default=5, help='学习率预热epoch数')
@@ -429,6 +429,7 @@ if __name__ == "__main__":
             'optimizer': optimizer.state_dict(),
             'lr': lr_scheduler.state_dict(),
             'best_loss': best_loss,
+            'fusion_strategy': args.fusion_strategy,  # 保存融合方案信息
         }
         
         # 保存last.pth（每个epoch都保存）
