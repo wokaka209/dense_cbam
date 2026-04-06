@@ -82,16 +82,35 @@ def parse_args():
     # 训练相关参数（优化版）
     parser.add_argument('--device', type=str, default=device_on(), help='训练设备')
     parser.add_argument('--batch_size', type=int, default=16, help='input batch size')
-    parser.add_argument('--num_epochs', type=int, default=30, help='number of epochs to train for（优化版：30）')
+    parser.add_argument('--num_epochs', type=int, default=50, help='number of epochs to train for（优化版：50）')
     parser.add_argument('--lr', type=float, default=2e-4, help='初始学习率（优化版：2e-4）')
     parser.add_argument('--resume_path', default='', type=str, help='导入已训练好的模型路径')
     parser.add_argument('--num_workers', type=int, default=4, help='载入数据集所调用的cpu线程数')
     
     # 优化参数
-    parser.add_argument('--fusion_strategy', type=int, default=1, choices=[1, 2, 3], 
-                        help='融合方案选择: 1=DenseBlock内部实时引导(推荐IVIF), 2=Decoder中特征选择(高质量), 3=多层次组合(最佳质量)')
+    parser.add_argument('--cbam_scheme', type=int, default=1, choices=[0, 1, 2], 
+                        help='CBAM实施方案选择: 0=不使用CBAM, 1=DenseBlock输出后CBAM, 2=融合层输入前CBAM')
+    parser.add_argument('--reduction_ratio', type=int, default=16, choices=[16, 32, 64, 128], 
+                        help='CBAM通道压缩比例: 16, 32, 64, 128等')
+    parser.add_argument('--use_color_aware', action='store_true', default=True, 
+                        help='是否使用颜色感知CBAM（解决泛黄问题）')
+    parser.add_argument('--color_preservation_weight', type=float, default=0.4, 
+                        choices=[0.1, 0.2, 0.3, 0.4, 0.5],
+                        help='颜色保护权重（0.0-1.0），推荐0.4')
     parser.add_argument('--use_mixed_precision', action='store_true', default=True, help='是否使用混合精度训练')
     parser.add_argument('--warmup_epochs', type=int, default=5, help='学习率预热epoch数')
+    
+    # 多尺度梯度损失参数
+    parser.add_argument('--use_multiscale_gradient', action='store_true', default=True, 
+                        help='是否启用多尺度梯度损失函数')
+    parser.add_argument('--gradient_scales', type=int, default=4, choices=[2, 3, 4, 5], 
+                        help='多尺度梯度计算的尺度数量')
+    parser.add_argument('--gradient_weight', type=float, default=1.5, 
+                        help='多尺度梯度损失的权重系数')
+    parser.add_argument('--gradient_alpha', type=float, default=1.5, 
+                        help='水平梯度权重（方向感知参数）')
+    parser.add_argument('--gradient_beta', type=float, default=1.0, 
+                        help='垂直梯度权重（方向感知参数）')
     
     # 打印输出
     parser.add_argument('--output', action='store_true', default=True, help="shows output")
@@ -114,15 +133,27 @@ def parse_args():
         print(f'resume_path: {args.resume_path}')
         
         print("----------优化选项----------")
-        print(f'fusion_strategy: {args.fusion_strategy}')
-        if args.fusion_strategy == 1:
-            print('  └─ 方案1：DenseBlock内部实时引导融合（推荐IVIF任务）')
-        elif args.fusion_strategy == 2:
-            print('  └─ 方案2：Decoder中解码特征选择（高质量融合需求）')
-        elif args.fusion_strategy == 3:
-            print('  └─ 方案3：多层次组合全方位增强（最佳融合质量）')
+        print(f'cbam_scheme: {args.cbam_scheme}')
+        if args.cbam_scheme == 0:
+            print('  └─ 不使用CBAM注意力机制')
+        elif args.cbam_scheme == 1:
+            print('  └─ 方案1：DenseBlock输出后应用CBAM')
+        elif args.cbam_scheme == 2:
+            print('  └─ 方案2：融合层输入前应用CBAM')
+        print(f'reduction_ratio: {args.reduction_ratio}')
+        print(f'use_color_aware: {args.use_color_aware}')
+        if args.use_color_aware:
+            print(f'  └─ 颜色保护权重: {args.color_preservation_weight}')
         print(f'use_mixed_precision: {args.use_mixed_precision}')
         print(f'warmup_epochs: {args.warmup_epochs}')
+        
+        print("----------多尺度梯度损失参数----------")
+        print(f'use_multiscale_gradient: {args.use_multiscale_gradient}')
+        if args.use_multiscale_gradient:
+            print(f'gradient_scales: {args.gradient_scales}')
+            print(f'gradient_weight: {args.gradient_weight}')
+            print(f'gradient_alpha: {args.gradient_alpha}')
+            print(f'gradient_beta: {args.gradient_beta}')
     return args
 
 
@@ -146,31 +177,34 @@ class WarmupScheduler:
         return self.optimizer.param_groups[0]['lr']
 
 
-def get_adaptive_loss_weights(epoch, total_epochs):
+def get_adaptive_loss_weights(epoch, total_epochs, use_multiscale_gradient=False):
     """
     自适应损失权重 - 专门优化EN、AG、MI指标
     
     策略：
     - 前期（0-30%）：注重像素重建（MSE权重高）
     - 中期（30-70%）：平衡像素和结构
-    - 后期（70-100%）：注重结构保持和细节（SSIM权重高）
+    - 后期（70-100%）：注重结构保持和细节（SSIM和梯度权重高）
     """
     progress = epoch / total_epochs
     
     if progress < 0.3:
         # 前期：注重像素重建
         mse_weight = 1.0
-        ssim_weight = 500
+        ssim_weight = 100
+        gradient_weight = 1.0 if use_multiscale_gradient else 0.0
     elif progress < 0.7:
         # 中期：平衡
-        mse_weight = 0.8
-        ssim_weight = 1000
-    else:
+        mse_weight = 1.0
+        ssim_weight = 100
+        gradient_weight = 1.5 if use_multiscale_gradient else 0.0
+    elif progress < 1.0:
         # 后期：注重结构保持和细节
-        mse_weight = 0.5
-        ssim_weight = 2000
+        mse_weight = 1.0
+        ssim_weight = 100
+        gradient_weight = 2.0 if use_multiscale_gradient else 0.0
     
-    return mse_weight, ssim_weight
+    return mse_weight, ssim_weight, gradient_weight
 
 
 if __name__ == "__main__":
@@ -203,16 +237,22 @@ if __name__ == "__main__":
     print("设备就绪...")
     
     # ----------------------------------------------------#
-    #           网络模型（支持三种融合方案）
+    #           网络模型（支持两种CBAM方案）
     # ----------------------------------------------------#
     model_name = "DenseFuse"
     in_channel = 1 if args.gray else 3
     out_channel = 1 if args.gray else 3
-    model_train = fuse_model(
-        model_name, 
+    
+    # 导入新的模型类
+    from models.DenseFuse import DenseFuse_train
+    
+    model_train = DenseFuse_train(
         input_nc=in_channel, 
         output_nc=out_channel, 
-        fusion_strategy=args.fusion_strategy
+        cbam_scheme=args.cbam_scheme,
+        reduction_ratio=args.reduction_ratio,
+        use_color_aware=args.use_color_aware,
+        color_preservation_weight=args.color_preservation_weight
     )
     model_train.to(device)
     print(f'模型参数量: {sum(p.numel() for p in model_train.parameters()):,}')
@@ -234,6 +274,20 @@ if __name__ == "__main__":
     # 损失函数
     mse_loss = torch.nn.MSELoss().to(device)
     ssim_loss = msssim
+    
+    # 多尺度梯度损失函数
+    if args.use_multiscale_gradient:
+        from utils.util_loss import MultiScaleGradientLoss
+        gradient_loss = MultiScaleGradientLoss(
+            scales=args.gradient_scales,
+            alpha=args.gradient_alpha,
+            beta=args.gradient_beta,
+            size_average=True
+        ).to(device)
+        print(f'[启用] 多尺度梯度损失函数已启用 (scales={args.gradient_scales}, weight={args.gradient_weight})')
+    else:
+        gradient_loss = None
+        print('✗ 多尺度梯度损失函数已禁用')
     
     # 优化版学习率策略：预热 + 余弦退火
     optimizer = torch.optim.AdamW(model_train.parameters(), args.lr, weight_decay=1e-4)
@@ -290,11 +344,11 @@ if __name__ == "__main__":
             init_epoch = checkpoint['epoch'] + 1  # 从下一个epoch继续
             best_loss = checkpoint['best_loss']
             
-            print(f'✓ 模型权重加载成功')
-            print(f'✓ 优化器状态恢复成功')
-            print(f'✓ 学习率调度器状态恢复成功')
-            print(f'✓ 将从epoch {init_epoch} 继续训练（上次训练到epoch {checkpoint["epoch"]}）')
-            print(f'✓ 上次最佳loss: {best_loss:.6f}')
+            print(f'[成功] 模型权重加载成功')
+            print(f'[成功] 优化器状态恢复成功')
+            print(f'[成功] 学习率调度器状态恢复成功')
+            print(f'[继续] 将从epoch {init_epoch} 继续训练（上次训练到epoch {checkpoint["epoch"]}）')
+            print(f'[上次] 上次最佳loss: {best_loss:.6f}')
             
         except Exception as e:
             print(f'❌ 错误：加载模型权重文件时发生异常')
@@ -318,8 +372,8 @@ if __name__ == "__main__":
     print('【Checkpoint管理】')
     print('='*60)
     print(f'Checkpoint目录: {checkpoint_dir}')
-    print('✓ 保存策略：每个epoch保存last.pth，loss改进时保存best.pth')
-    print('✓ 自动清理：每个epoch清理旧epoch*.pth文件')
+    print('[策略] 保存策略：每个epoch保存last.pth，loss改进时保存best.pth')
+    print('[清理] 自动清理：每个epoch清理旧epoch*.pth文件')
     cleanup_old_checkpoints(checkpoint_dir)
     print('='*60)
     
@@ -344,7 +398,9 @@ if __name__ == "__main__":
             current_lr = lr_scheduler.get_last_lr()[0]
         
         # 获取自适应损失权重
-        mse_weight, ssim_weight = get_adaptive_loss_weights(epoch, num_epochs)
+        mse_weight, ssim_weight, gradient_weight = get_adaptive_loss_weights(
+            epoch, num_epochs, args.use_multiscale_gradient
+        )
         
         # 更新损失函数字典
         criterion = {
@@ -353,9 +409,18 @@ if __name__ == "__main__":
             "lambda": ssim_weight,
         }
         
+        # 如果启用了多尺度梯度损失，添加到损失函数字典
+        if args.use_multiscale_gradient and gradient_loss is not None:
+            criterion["gradient_loss"] = gradient_loss
+            criterion["gradient_weight"] = gradient_weight * args.gradient_weight
+        
         # =====================train============================
         model_train.train()
         train_epoch_loss = {"mse_loss": [], "ssim_loss": [], "total_loss": []}
+        
+        # 如果启用了多尺度梯度损失，初始化梯度损失记录
+        if args.use_multiscale_gradient:
+            train_epoch_loss["gradient_loss"] = []
         
         from tqdm import tqdm
         pbar = tqdm(train_loader, total=len(train_loader))
@@ -370,7 +435,14 @@ if __name__ == "__main__":
             # 计算损失（使用自适应权重）
             pixel_loss_value = criterion["mse_loss"](outputs, labels)
             ssim_loss_value = 1 - criterion["ssim_loss"](outputs, labels, normalize=True)
+            
+            # 基础损失
             loss = mse_weight * pixel_loss_value + ssim_weight * ssim_loss_value
+            
+            # 如果启用了多尺度梯度损失，添加梯度损失
+            if args.use_multiscale_gradient and "gradient_loss" in criterion:
+                gradient_loss_value = criterion["gradient_loss"](outputs, labels)
+                loss += criterion["gradient_weight"] * gradient_loss_value
             
             # 反向传播
             loss.backward()
@@ -381,15 +453,28 @@ if __name__ == "__main__":
             train_epoch_loss["ssim_loss"].append(ssim_loss_value.item())
             train_epoch_loss["total_loss"].append(loss.item())
             
+            # 如果启用了多尺度梯度损失，记录梯度损失值
+            if args.use_multiscale_gradient and "gradient_loss" in criterion:
+                train_epoch_loss["gradient_loss"].append(gradient_loss_value.item())
+            
             # 显示训练进度（包含继续训练信息）
             mode_str = "继续训练" if init_epoch > 0 else "从头训练"
             pbar.set_description(f'Epoch [{epoch + 1}/{num_epochs}] ({mode_str})')
-            pbar.set_postfix({
+            
+            # 构建进度显示信息
+            postfix_info = {
                 'loss': f'{loss.item():.4f}',
                 'lr': f'{current_lr:.6f}',
                 'mse_w': f'{mse_weight:.1f}',
                 'ssim_w': f'{ssim_weight:.0f}'
-            })
+            }
+            
+            # 如果启用了多尺度梯度损失，添加梯度损失信息
+            if args.use_multiscale_gradient and "gradient_loss" in criterion:
+                postfix_info['grad_w'] = f'{criterion["gradient_weight"]:.0f}'
+                postfix_info['grad_loss'] = f'{gradient_loss_value.item():.4f}'
+            
+            pbar.set_postfix(postfix_info)
         
         # 计算平均损失
         train_loss = {
@@ -397,6 +482,10 @@ if __name__ == "__main__":
             "ssim_loss": sum(train_epoch_loss["ssim_loss"]) / len(train_epoch_loss["ssim_loss"]),
             "total_loss": sum(train_epoch_loss["total_loss"]) / len(train_epoch_loss["total_loss"]),
         }
+        
+        # 如果启用了多尺度梯度损失，记录梯度损失
+        if args.use_multiscale_gradient and "gradient_loss" in train_epoch_loss:
+            train_loss["gradient_loss"] = sum(train_epoch_loss["gradient_loss"]) / len(train_epoch_loss["gradient_loss"])
         
         # =====================valid============================
         # 无验证集，替换成在tensorboard中测试
@@ -415,6 +504,10 @@ if __name__ == "__main__":
         writer.add_scalar('mse_weight', mse_weight, global_step=epoch)
         writer.add_scalar('ssim_weight', ssim_weight, global_step=epoch)
         
+        # 如果启用了多尺度梯度损失，记录梯度权重
+        if args.use_multiscale_gradient:
+            writer.add_scalar('gradient_weight', gradient_weight * args.gradient_weight, global_step=epoch)
+        
         # =====================checkpoint=======================
         # 确保checkpoint目录存在
         if not os.path.exists(checkpoint_dir):
@@ -429,7 +522,10 @@ if __name__ == "__main__":
             'optimizer': optimizer.state_dict(),
             'lr': lr_scheduler.state_dict(),
             'best_loss': best_loss,
-            'fusion_strategy': args.fusion_strategy,  # 保存融合方案信息
+            'cbam_scheme': args.cbam_scheme,  # 保存CBAM方案信息
+            'reduction_ratio': args.reduction_ratio,  # 保存reduction_ratio参数
+            'use_color_aware': args.use_color_aware,  # 保存颜色感知CBAM信息
+            'color_preservation_weight': args.color_preservation_weight,  # 保存颜色保护权重
         }
         
         # 保存last.pth（每个epoch都保存）
@@ -442,7 +538,7 @@ if __name__ == "__main__":
             checkpoint['best_loss'] = best_loss
             best_save_path = os.path.join(checkpoint_dir, 'best.pth')
             torch.save(checkpoint, best_save_path)
-            print(f'✓ 保存最佳模型: best.pth (loss: {best_loss:.6f})')
+            print(f'[保存] 保存最佳模型: best.pth (loss: {best_loss:.6f})')
         
         # 清理旧的epoch*.pth文件（只保留best.pth和last.pth）
         cleanup_old_checkpoints(checkpoint_dir)
@@ -462,14 +558,14 @@ if __name__ == "__main__":
     print()
     print('【最终Checkpoint文件】')
     if os.path.exists(os.path.join(checkpoint_dir, 'best.pth')):
-        print(f'  ✓ best.pth - 最佳模型 (loss: {best_loss:.6f})')
+        print(f'  [最佳] best.pth - 最佳模型 (loss: {best_loss:.6f})')
     else:
-        print(f'  ✗ best.pth - 未生成')
+        print(f'  [未生成] best.pth - 未生成')
     if os.path.exists(os.path.join(checkpoint_dir, 'last.pth')):
         last_info = torch.load(os.path.join(checkpoint_dir, 'last.pth'), map_location='cpu')
-        print(f'  ✓ last.pth - 最新模型 (epoch: {last_info["epoch"]}, loss: {last_info["best_loss"]:.6f})')
+        print(f'  [最新] last.pth - 最新模型 (epoch: {last_info["epoch"]}, loss: {last_info["best_loss"]:.6f})')
     else:
-        print(f'  ✗ last.pth - 未生成')
+        print(f'  [未生成] last.pth - 未生成')
     print()
     
     if init_epoch > 0:

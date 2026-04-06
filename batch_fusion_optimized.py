@@ -1,62 +1,270 @@
 # -*- coding: utf-8 -*-
 """
 @file name:batch_fusion_optimized.py
-@desc: 优化版批量融合脚本 - 使用高级融合策略提升EN、AG、MI、Qabf指标
+@desc: 优化版批量融合脚本 - 支持CBAM注意力机制和高级融合策略
 @Writer: wokaka209
-@Date: 2026-03-13
+@Date: 2026-04-05
 """
 import os
 import torch
 from torchvision.utils import save_image
-from models import fuse_model
 from torchvision import transforms
 from torchvision.io import read_image, ImageReadMode
 from tqdm import tqdm
 import argparse
-from fusion_strategy.advanced_fusion_optimized import AdvancedFusionStrategyOptimized
+
+
+def parse_arguments():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(description='支持CBAM的批量图像融合')
+    
+    # 基础参数
+    parser.add_argument('--ir_dir', type=str, 
+                        default='E:/whx_Graduation project/baseline_project/dataset/ir', 
+                        help='红外图像目录')
+    parser.add_argument('--vi_dir', type=str, 
+                        default='E:/whx_Graduation project/baseline_project/dataset/vi', 
+                        help='可见光图像目录')
+    parser.add_argument('--output_dir', type=str, 
+                        default='data_result/batch_fusion_optimized_colorcbam1_55', 
+                        help='输出目录')
+    parser.add_argument('--model_weights', type=str, 
+                        default='runs/train_04-05_23-52/checkpoints/best.pth', 
+                        help='模型权重路径')
+    
+    # CBAM参数
+    parser.add_argument('--cbam_scheme', type=int, 
+                        default=1, 
+                        choices=[0, 1, 2],
+                        help='CBAM实施方案选择: 0=不使用, 1=方案1, 2=方案2')
+    parser.add_argument('--reduction_ratio', type=int, 
+                        default=16, 
+                        choices=[8, 16, 32, 64, 128, 256],
+                        help='CBAM通道压缩比例')
+    parser.add_argument('--use_color_aware', action='store_true', 
+                        default=True,
+                        help='是否使用颜色感知CBAM（解决泛黄问题）')
+    parser.add_argument('--color_preservation_weight', type=float, 
+                        default=0.4, 
+                        choices=[0.1, 0.2, 0.3, 0.4, 0.5],
+                        help='颜色保护权重（0.0-1.0），推荐0.3')
+    
+    # 融合策略参数
+    parser.add_argument('--fusion_strategy', type=str, 
+                        default='hybrid',
+                        choices=['mean', 'max', 'l1norm', 'adaptive_l1', 'gradient_based', 
+                                'enhanced_l1', 'multi_scale', 'gradient', 'hybrid'],
+                        help='融合策略选择: mean=平均, max=最大值, l1norm=L1范数, adaptive_l1=自适应L1, gradient_based=基于梯度, enhanced_l1=增强L1, multi_scale=多尺度, gradient=梯度引导, hybrid=混合融合')
+    
+    # 混合融合权重配置（仅对hybrid策略有效）
+    parser.add_argument('--hybrid_weights_preset', type=str,
+                        default='quality',
+                        choices=['balanced', 'quality', 'detail', 'speed', 'edge_enhanced', 'structure_preserve'],
+                        help='混合融合权重预设: balanced=平衡(默认), quality=高质量, detail=细节增强, speed=快速处理, edge_enhanced=边缘增强, structure_preserve=结构保持')
+    
+    # 其他参数
+    parser.add_argument('--gray', action='store_true', 
+                        default=False,
+                        help='是否使用灰度模式')
+    
+    return parser.parse_args()
+
+
+# 导入新的CBAM模型
+from models.DenseFuse import DenseFuse_train
+
+# 导入融合策略模块
+try:
+    from fusion_strategy.advanced_fusion import apply_fusion_strategy
+    from utils.util_fusion import FusionConfig as BaseFusionConfig
+    FUSION_STRATEGY_AVAILABLE = True
+except ImportError:
+    print("[警告] 高级融合策略模块不可用，使用简单融合策略")
+    FUSION_STRATEGY_AVAILABLE = False
+
+# 参数配置类
+class FusionConfig:
+    """融合配置类 - 统一管理所有参数"""
+    
+    # 类属性：默认配置值（与命令行参数保持一致）
+    DEFAULT_CONFIG = {
+        # 基础参数
+        'ir_dir': 'E:/whx_Graduation project/baseline_project/dataset/ir',
+        'vi_dir': 'E:/whx_Graduation project/baseline_project/dataset/vi',
+        'output_dir': 'data_result/batch_fusion_optimized_colorcbam1_55',
+        'model_weights': 'runs/train_04-05_23-52/checkpoints/best.pth',
+        
+        # CBAM参数
+        'cbam_scheme': 1,  # 0=不使用, 1=方案1, 2=方案2
+        'reduction_ratio': 16,  # CBAM通道压缩比例
+        'use_color_aware': True,  # 是否使用颜色感知CBAM（解决泛黄问题）
+        'color_preservation_weight': 0.4,  # 颜色保护权重（0.0-1.0）
+        
+        # 融合算法参数
+        'fusion_strategy': 'hybrid',  # 融合策略选择
+        'hybrid_weights_preset': 'balanced',  # 混合融合权重预设
+        'fusion_algorithm': 'hybrid',  # 融合算法选择（内部使用）
+        'gray': False,  # 是否使用灰度模式
+        'model_name': 'DenseFuse',
+        'device': "cuda" if torch.cuda.is_available() else "cpu",
+        
+        # 图像处理参数
+        'target_size': (768, 1024)
+    }
+    
+    def __init__(self, args=None):
+        """
+        初始化配置
+        
+        Args:
+            args: 命令行参数对象，如果提供则使用参数值，否则使用默认值
+        """
+        # 使用类默认配置初始化所有属性
+        for key, value in self.DEFAULT_CONFIG.items():
+            setattr(self, key, value)
+        
+        # 如果提供了命令行参数，更新配置
+        if args is not None:
+            self.update_from_args(args)
+        
+    def update_from_args(self, args):
+        """从命令行参数更新配置"""
+        if hasattr(args, 'ir_dir') and args.ir_dir:
+            self.ir_dir = args.ir_dir
+        if hasattr(args, 'vi_dir') and args.vi_dir:
+            self.vi_dir = args.vi_dir
+        if hasattr(args, 'output_dir') and args.output_dir:
+            self.output_dir = args.output_dir
+        if hasattr(args, 'model_weights') and args.model_weights:
+            self.model_weights = args.model_weights
+        if hasattr(args, 'fusion_strategy') and args.fusion_strategy:
+            self.fusion_strategy = args.fusion_strategy
+        if hasattr(args, 'hybrid_weights_preset') and args.hybrid_weights_preset:
+            self.hybrid_weights_preset = args.hybrid_weights_preset
+        if hasattr(args, 'fusion_algorithm') and args.fusion_algorithm:
+            self.fusion_algorithm = args.fusion_algorithm
+        if hasattr(args, 'cbam_scheme') and args.cbam_scheme is not None:
+            self.cbam_scheme = args.cbam_scheme
+        if hasattr(args, 'reduction_ratio') and args.reduction_ratio is not None:
+            self.reduction_ratio = args.reduction_ratio
+        if hasattr(args, 'use_color_aware') and args.use_color_aware is not None:
+            self.use_color_aware = args.use_color_aware
+        if hasattr(args, 'color_preservation_weight') and args.color_preservation_weight is not None:
+            self.color_preservation_weight = args.color_preservation_weight
+        if hasattr(args, 'gray') and args.gray is not None:
+            self.gray = args.gray
+    
+    def to_dict(self):
+        """将配置转换为字典格式"""
+        return {key: getattr(self, key) for key in self.DEFAULT_CONFIG.keys()}
+    
+    def validate(self):
+        """验证配置参数的有效性"""
+        # 检查路径是否存在
+        if not os.path.exists(self.ir_dir):
+            raise ValueError(f"红外图像目录不存在: {self.ir_dir}")
+        if not os.path.exists(self.vi_dir):
+            raise ValueError(f"可见光图像目录不存在: {self.vi_dir}")
+        
+        # 检查模型权重文件是否存在
+        if not os.path.exists(self.model_weights):
+            raise ValueError(f"模型权重文件不存在: {self.model_weights}")
+        
+        # 检查参数范围
+        if self.cbam_scheme not in [0, 1, 2]:
+            raise ValueError(f"CBAM方案参数无效: {self.cbam_scheme}")
+        if self.reduction_ratio not in [8, 16, 32, 64, 128, 256]:
+            raise ValueError(f"reduction_ratio参数无效: {self.reduction_ratio}")
+        if not 0.1 <= self.color_preservation_weight <= 0.5:
+            raise ValueError(f"颜色保护权重超出范围: {self.color_preservation_weight}")
+        
+        return True
+    
+    def __str__(self):
+        """返回配置的字符串表示"""
+        config_info = [
+            f"FusionConfig:",
+            f"  红外图像目录: {self.ir_dir}",
+            f"  可见光图像目录: {self.vi_dir}",
+            f"  输出目录: {self.output_dir}",
+            f"  模型权重: {self.model_weights}",
+            f"  CBAM方案: {self.cbam_scheme}",
+            f"  reduction_ratio: {self.reduction_ratio}",
+            f"  颜色感知CBAM: {self.use_color_aware}",
+            f"  颜色保护权重: {self.color_preservation_weight}",
+            f"  灰度模式: {self.gray}",
+            f"  设备: {self.device}"
+        ]
+        return "\n".join(config_info)
 
 
 class BatchImageFusionOptimized:
     def __init__(self, config):
         self.config = config
-        self.target_size = (768, 1024)
-        self.fusion_strategy_obj = AdvancedFusionStrategyOptimized()
+        self.target_size = config.target_size
         self.load_model()
 
     def load_model(self):
         in_channel = 1 if self.config.gray else 3
         out_channel = 1 if self.config.gray else 3
         
-        # 从权重文件中读取训练时使用的融合方案
-        checkpoint = torch.load(self.config.resume_path,
+        # 从权重文件中读取训练时使用的CBAM方案
+        checkpoint = torch.load(self.config.model_weights,
                                 map_location=self.config.device, weights_only=False)
         
-        # 检查权重文件中是否保存了融合方案信息
-        fusion_strategy = 1  # 默认使用方案3（最佳质量）
-        if 'fusion_strategy' in checkpoint:
-            fusion_strategy = checkpoint['fusion_strategy']
-            print(f'✓ 从权重文件读取融合方案: {fusion_strategy}')
-        else:
-            print(f'⚠️ 权重文件未保存融合方案信息，使用默认方案: {fusion_strategy}')
+        # 检查权重文件中是否保存了CBAM方案信息
+        cbam_scheme = self.config.cbam_scheme  # 默认使用配置中的CBAM方案
+        reduction_ratio = self.config.reduction_ratio
+        use_color_aware = self.config.use_color_aware
+        color_preservation_weight = self.config.color_preservation_weight
         
-        # 使用与训练时相同的融合方案创建模型
-        self.model = fuse_model(self.config.model_name,
-                                input_nc=in_channel,
-                                output_nc=out_channel,
-                                fusion_strategy=fusion_strategy)
+        if 'cbam_scheme' in checkpoint:
+            cbam_scheme = checkpoint['cbam_scheme']
+            print(f'[读取] 从权重文件读取CBAM方案: {cbam_scheme}')
+        else:
+            print(f'[默认] 权重文件未保存CBAM方案信息，使用配置方案: {cbam_scheme}')
+            
+        if 'reduction_ratio' in checkpoint:
+            reduction_ratio = checkpoint['reduction_ratio']
+            print(f'[读取] 从权重文件读取reduction_ratio: {reduction_ratio}')
+        else:
+            print(f'[默认] 权重文件未保存reduction_ratio信息，使用配置值: {reduction_ratio}')
+            
+        if 'use_color_aware' in checkpoint:
+            use_color_aware = checkpoint['use_color_aware']
+            print(f'[读取] 从权重文件读取use_color_aware: {use_color_aware}')
+        else:
+            print(f'[默认] 权重文件未保存use_color_aware信息，使用配置值: {use_color_aware}')
+            
+        if 'color_preservation_weight' in checkpoint:
+            color_preservation_weight = checkpoint['color_preservation_weight']
+            print(f'[读取] 从权重文件读取color_preservation_weight: {color_preservation_weight}')
+        else:
+            print(f'[默认] 权重文件未保存color_preservation_weight信息，使用配置值: {color_preservation_weight}')
+        
+        # 使用CBAM方案创建模型
+        self.model = DenseFuse_train(
+            input_nc=in_channel,
+            output_nc=out_channel,
+            cbam_scheme=cbam_scheme,
+            reduction_ratio=reduction_ratio,
+            use_color_aware=use_color_aware,
+            color_preservation_weight=color_preservation_weight
+        )
         self.model = self.model.to(self.config.device)
         
         # 使用strict=False处理权重不匹配（如缺少注意力权重）
         self.model.encoder.load_state_dict(checkpoint['encoder_state_dict'], strict=False)
         self.model.decoder.load_state_dict(checkpoint['decoder_state_dict'], strict=False)
-        print(f'✓ 模型加载成功: {self.config.resume_path}')
-        print(f'✓ 使用融合方案: {fusion_strategy}')
-        if fusion_strategy == 1:
-            print('  └─ 方案1：DenseBlock内部实时引导融合（推荐IVIF任务）')
-        elif fusion_strategy == 2:
-            print('  └─ 方案2：Decoder中特征选择（高质量融合需求）')
-        elif fusion_strategy == 3:
-            print('  └─ 方案3：多层次组合全方位增强（最佳融合质量）')
+        
+        print(f'[成功] 模型加载成功: {self.config.model_weights}')
+        print(f'[方案] 使用CBAM方案: {cbam_scheme} (reduction_ratio={reduction_ratio})')
+        if cbam_scheme == 0:
+            print('  [方案0] 不使用CBAM注意力机制')
+        elif cbam_scheme == 1:
+            print('  [方案1] DenseBlock输出后应用CBAM')
+        elif cbam_scheme == 2:
+            print('  [方案2] 融合层输入前应用CBAM')
 
     def preprocess_image(self, image_path):
         image = read_image(image_path,
@@ -71,7 +279,7 @@ class BatchImageFusionOptimized:
         image = image_transforms(image).unsqueeze(0)
         return image, original_size
 
-    def run_single(self, ir_path, vi_path, output_path, fusion_strategy="hybrid"):
+    def run_single(self, ir_path, vi_path, output_path):
         self.model.eval()
         with torch.no_grad():
             ir_image, original_size = self.preprocess_image(ir_path)
@@ -80,12 +288,18 @@ class BatchImageFusionOptimized:
             ir_image = ir_image.to(self.config.device)
             vi_image = vi_image.to(self.config.device)
 
-            ir_features = self.model.encoder(ir_image)
-            vi_features = self.model.encoder(vi_image)
-
-            fused_features = self.fusion_strategy(ir_features, vi_features, fusion_strategy)
-
-            fused_image = self.model.decoder(fused_features)
+            # 根据CBAM方案选择不同的前向传播方式
+            if self.model.cbam_scheme == 2:
+                # 方案2：使用双输入前向传播
+                fused_image = self.model.forward_dual_input(ir_image, vi_image)
+            else:
+                # 方案0和方案1：分别处理然后融合
+                ir_features = self.model.encoder(ir_image)
+                vi_features = self.model.encoder(vi_image)
+                
+                # 简单平均融合策略
+                fused_features = (ir_features + vi_features) / 2
+                fused_image = self.model.decoder(fused_features)
 
             fused_image = fused_image.cpu().squeeze(0)
             
@@ -101,20 +315,77 @@ class BatchImageFusionOptimized:
             save_image(fused_image, output_path)
             return True
     
-    def fusion_strategy(self, feature1: torch.Tensor, feature2: torch.Tensor, strategy="hybrid") -> torch.Tensor:
-        """高级融合策略 - 调用fusion_strategy.advanced_fusion模块"""
-        if strategy == "enhanced_l1":
-            return self.fusion_strategy_obj.enhanced_adaptive_l1(feature1, feature2)
-        elif strategy == "multi_scale":
-            return self.fusion_strategy_obj.multi_scale_fusion(feature1, feature2)
-        elif strategy == "gradient":
-            return self.fusion_strategy_obj.gradient_guided_fusion(feature1, feature2)
-        elif strategy == "hybrid":
-            return self.fusion_strategy_obj.hybrid_fusion(feature1, feature2)
+    def fusion_strategy(self, feature1: torch.Tensor, feature2: torch.Tensor) -> torch.Tensor:
+        """融合策略 - 支持多种融合算法和混合融合权重配置"""
+        
+        # 如果高级融合策略可用，使用高级策略
+        if FUSION_STRATEGY_AVAILABLE and self.config.fusion_strategy in ['enhanced_l1', 'multi_scale', 'gradient', 'hybrid']:
+            try:
+                # 对于hybrid策略，使用优化版并支持权重配置
+                if self.config.fusion_strategy == 'hybrid':
+                    from fusion_strategy.advanced_fusion_optimized import AdvancedFusionStrategyOptimized
+                    
+                    # 获取预设的权重配置
+                    hybrid_weights = AdvancedFusionStrategyOptimized.get_preset_config(
+                        self.config.hybrid_weights_preset
+                    )
+                    
+                    # 创建带权重的融合策略实例
+                    fusion_obj = AdvancedFusionStrategyOptimized(hybrid_weights=hybrid_weights)
+                    
+                    print(f"[配置] 使用混合融合策略，预设: {self.config.hybrid_weights_preset}，权重: {hybrid_weights}")
+                    
+                    return fusion_obj.hybrid_fusion(feature1, feature2)
+                else:
+                    return apply_fusion_strategy(feature1, feature2, strategy=self.config.fusion_strategy)
+            except Exception as e:
+                print(f"[警告] 高级融合策略失败，使用简单策略: {e}")
+        
+        # 简单融合策略
+        if self.config.fusion_strategy == 'mean':
+            return (feature1 + feature2) / 2
+        elif self.config.fusion_strategy == 'max':
+            return torch.maximum(feature1, feature2)
+        elif self.config.fusion_strategy == 'l1norm':
+            # L1范数融合策略
+            l1_norm1 = torch.abs(feature1)
+            l1_norm2 = torch.abs(feature2)
+            mask = (l1_norm1 > l1_norm2).float()
+            return mask * feature1 + (1 - mask) * feature2
+        elif self.config.fusion_strategy == 'adaptive_l1':
+            # 自适应L1范数融合策略
+            l1_norm1 = torch.abs(feature1)
+            l1_norm2 = torch.abs(feature2)
+            total_energy = l1_norm1 + l1_norm2 + 1e-8
+            weight1 = l1_norm1 / total_energy
+            weight2 = l1_norm2 / total_energy
+            return weight1 * feature1 + weight2 * feature2
+        elif self.config.fusion_strategy == 'gradient_based':
+            # 基于梯度的融合策略
+            grad1_x = torch.abs(feature1[:, :, :, 1:] - feature1[:, :, :, :-1])
+            grad1_y = torch.abs(feature1[:, :, 1:, :] - feature1[:, :, :-1, :])
+            grad2_x = torch.abs(feature2[:, :, :, 1:] - feature2[:, :, :, :-1])
+            grad2_y = torch.abs(feature2[:, :, 1:, :] - feature2[:, :, :-1, :])
+            
+            grad_mag1 = torch.sqrt(grad1_x[:, :, :, :-1]**2 + grad1_y[:, :, :-1, :]**2)
+            grad_mag2 = torch.sqrt(grad2_x[:, :, :, :-1]**2 + grad2_y[:, :, :-1, :]**2)
+            
+            # 扩展梯度信息以匹配原始尺寸
+            pad_x = torch.zeros_like(grad_mag1[:, :, :, -1:]).expand(-1, -1, -1, 1)
+            grad_mag1 = torch.cat([grad_mag1, pad_x], dim=3)
+            grad_mag2 = torch.cat([grad_mag2, pad_x.clone()], dim=3)
+            
+            pad_y = torch.zeros_like(grad_mag1[:, :, -1:, :]).expand(-1, -1, 1, -1)
+            grad_mag1 = torch.cat([grad_mag1, pad_y], dim=2)
+            grad_mag2 = torch.cat([grad_mag2, pad_y.clone()], dim=2)
+            
+            mask = (grad_mag1 > grad_mag2).float()
+            return mask * feature1 + (1 - mask) * feature2
         else:
-            raise ValueError(f"Unknown fusion strategy: {strategy}")
+            # 默认使用平均融合
+            return (feature1 + feature2) / 2
 
-    def batch_fusion(self, ir_dir, vi_dir, output_dir, fusion_strategy='hybrid'):
+    def batch_fusion(self, ir_dir, vi_dir, output_dir):
         os.makedirs(output_dir, exist_ok=True)
         
         ir_files = sorted([f for f in os.listdir(ir_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
@@ -123,12 +394,12 @@ class BatchImageFusionOptimized:
         print(f'找到 {len(ir_files)} 张红外图像, {len(vi_files)} 张可见光图像')
         
         if len(ir_files) != len(vi_files):
-            print(f'⚠️  警告: 图像数量不匹配 ({len(ir_files)} vs {len(vi_files)})')
+            print(f'[警告] 图像数量不匹配 ({len(ir_files)} vs {len(vi_files)})')
             
         processed_count = 0
         failed_count = 0
         
-        print(f'开始批量融合（策略: {fusion_strategy}）...')
+        print(f'开始批量融合（CBAM方案: {self.model.cbam_scheme}, 融合策略: {self.config.fusion_strategy}）...')
         
         for i, (ir_file, vi_file) in enumerate(tqdm(zip(ir_files, vi_files), total=len(ir_files), desc="融合进度")):
             ir_path = os.path.join(ir_dir, ir_file)
@@ -139,7 +410,7 @@ class BatchImageFusionOptimized:
             output_path = os.path.join(output_dir, output_filename)
             
             try:
-                success = self.run_single(ir_path, vi_path, output_path, fusion_strategy)
+                success = self.run_single(ir_path, vi_path, output_path)
                 
                 if success:
                     processed_count += 1
@@ -148,7 +419,7 @@ class BatchImageFusionOptimized:
                     
             except Exception as e:
                 failed_count += 1
-                print(f'\n❌ 处理失败 {ir_file} 和 {vi_file}: {str(e)}')
+                print(f'\n[失败] 处理失败 {ir_file} 和 {vi_file}: {str(e)}')
         
         print(f'\n{"="*60}')
         print(f'批量融合完成！')
@@ -156,60 +427,113 @@ class BatchImageFusionOptimized:
         print(f'失败数量: {failed_count}')
         print(f'成功率: {processed_count/len(ir_files)*100:.2f}%')
         print(f'输出目录: {output_dir}')
-        print(f'融合策略: {fusion_strategy}')
+        print(f'CBAM方案: {self.model.cbam_scheme}')
+        print(f'融合策略: {self.config.fusion_strategy}')
         print(f'{"="*60}')
         return processed_count, failed_count
 
 
-def batch_fusion_main(ir_dir, vi_dir, output_dir, model_weights, fusion_algorithm='hybrid'):
-    class Config:
-        def __init__(self):
-            self.ir_path = ir_dir
-            self.vi_path = vi_dir
-            self.resume_path = model_weights
-            self.fusion_algorithm = fusion_algorithm  # 改为融合算法
-            self.gray = False
-            self.model_name = 'DenseFuse'
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    config = Config()
+def batch_fusion_main(config):
+    """批量融合主函数"""
     fusion_model = BatchImageFusionOptimized(config)
     
-    processed, failed = fusion_model.batch_fusion(ir_dir, vi_dir, output_dir, fusion_algorithm)
+    processed, failed = fusion_model.batch_fusion(config.ir_dir, config.vi_dir, config.output_dir)
     
     return processed, failed
 
 
+def print_config_summary(config):
+    """打印配置摘要 - 清晰显示当前使用的方案"""
+    print("="*60)
+    print("支持CBAM的批量图像融合 - 配置摘要")
+    print("="*60)
+    
+    # 基础配置
+    print("[基础配置]")
+    print(f"  红外图像目录: {config.ir_dir}")
+    print(f"  可见光图像目录: {config.vi_dir}")
+    print(f"  输出目录: {config.output_dir}")
+    print(f"  模型权重: {config.model_weights}")
+    
+    # CBAM方案配置
+    print("\n[CBAM注意力方案]")
+    if config.cbam_scheme == 0:
+        print("  方案0: 不使用CBAM注意力机制")
+    elif config.cbam_scheme == 1:
+        print("  方案1: DenseBlock输出后应用CBAM")
+    elif config.cbam_scheme == 2:
+        print("  方案2: 融合层输入前应用CBAM")
+    print(f"  reduction_ratio: {config.reduction_ratio}")
+    
+    # 颜色感知配置
+    print("\n[颜色感知配置]")
+    if config.use_color_aware:
+        print(f"  [启用] 颜色感知CBAM (解决泛黄问题)")
+        print(f"  颜色保护权重: {config.color_preservation_weight}")
+    else:
+        print("  [禁用] 颜色感知CBAM")
+    
+    # 融合策略配置
+    print("\n[融合策略配置]")
+    print(f"  融合策略: {config.fusion_strategy}")
+    
+    # 策略描述
+    strategy_descriptions = {
+        'mean': '简单平均融合',
+        'max': '最大值融合',
+        'l1norm': 'L1范数融合',
+        'adaptive_l1': '自适应L1融合',
+        'gradient_based': '基于梯度融合',
+        'enhanced_l1': '增强L1融合',
+        'multi_scale': '多尺度融合',
+        'gradient': '梯度引导融合',
+        'hybrid': '混合融合（推荐）'
+    }
+    description = strategy_descriptions.get(config.fusion_strategy, '未知策略')
+    print(f"  策略描述: {description}")
+    
+    # 混合融合权重配置（仅对hybrid策略显示）
+    if config.fusion_strategy == 'hybrid':
+        print(f"\n  [混合融合权重预设: {config.hybrid_weights_preset}]")
+        
+        preset_descriptions = {
+            'balanced': '平衡质量与速度（默认推荐）',
+            'quality': '高质量优先，适合精细图像',
+            'detail': '细节增强，适合边缘丰富场景',
+            'speed': '快速处理，减少计算量',
+            'edge_enhanced': '边缘增强，适合医学影像',
+            'structure_preserve': '结构保持，适合建筑/场景'
+        }
+        preset_desc = preset_descriptions.get(config.hybrid_weights_preset, '未知预设')
+        print(f"  预设描述: {preset_desc}")
+    
+    # 其他配置
+    print("\n[其他配置]")
+    print(f"  灰度模式: {'启用' if config.gray else '禁用'}")
+    print(f"  设备: {config.device}")
+    print(f"  融合算法: {config.fusion_algorithm}")
+    print(f"  目标尺寸: {config.target_size}")
+    
+    print("="*60)
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='优化版批量图像融合')
-    parser.add_argument('--ir_dir', type=str, 
-                        default='E:/whx_Graduation project/baseline_project/dataset/ir', 
-                        help='红外图像目录')
-    parser.add_argument('--vi_dir', type=str, 
-                        default='E:/whx_Graduation project/baseline_project/dataset/vi', 
-                        help='可见光图像目录')
-    parser.add_argument('--output_dir', type=str, 
-                        default='data_result/batch_fusion_optimized_colorcbam1-epoch30', 
-                        help='输出目录')
-    parser.add_argument('--model_weights', type=str, 
-                        default='runs/train_04-02_16-05/checkpoints/best.pth', 
-                        help='模型权重路径')
-    parser.add_argument('--fusion_algorithm', type=str, 
-                        default='hybrid', 
-                        choices=['enhanced_l1', 'multi_scale', 'gradient', 'hybrid'],
-                        help='融合算法选择（推荐使用hybrid）')
+    # 解析命令行参数
+    args = parse_arguments()
     
-    args = parser.parse_args()
+    # 创建配置对象（直接传入命令行参数）
+    config = FusionConfig(args)
     
-    print("="*60)
-    print("优化版批量图像融合")
-    print("="*60)
-    print(f"红外图像目录: {args.ir_dir}")
-    print(f"可见光图像目录: {args.vi_dir}")
-    print(f"输出目录: {args.output_dir}")
-    print(f"模型权重: {args.model_weights}")
-    print(f"融合算法: {args.fusion_algorithm}")
-    print("="*60)
+    # 验证配置
+    try:
+        config.validate()
+        print("[通过] 配置验证通过")
+    except ValueError as e:
+        print(f"[失败] 配置验证失败: {e}")
+        exit(1)
     
-    batch_fusion_main(args.ir_dir, args.vi_dir, args.output_dir, 
-                    args.model_weights, args.fusion_algorithm)
+    # 打印清晰的配置摘要
+    print_config_summary(config)
+    
+    # 执行批量融合
+    batch_fusion_main(config)

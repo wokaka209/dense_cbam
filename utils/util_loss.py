@@ -133,3 +133,162 @@ class MSSSIM(torch.nn.Module):
     def forward(self, img1, img2):
         # TODO: store window between calls if possible
         return msssim(img1, img2, window_size=self.window_size, size_average=self.size_average)
+
+
+class MultiScaleGradientLoss(torch.nn.Module):
+    """
+    融合方向感知多尺度梯度损失函数
+    
+    该损失函数通过多尺度梯度计算和方向感知机制，有效捕捉图像不同尺度下的梯度信息，
+    特别适用于图像融合任务中保持边缘和纹理细节。
+    
+    特点：
+    - 多尺度梯度计算：在不同尺度下计算梯度，捕捉不同层次的边缘信息
+    - 方向感知：考虑水平和垂直方向的梯度特征
+    - 数值稳定性：使用平滑处理和数值稳定机制
+    - 可配置性：支持自定义尺度数量和权重
+    """
+    
+    def __init__(self, scales=4, alpha=1.0, beta=1.0, epsilon=1e-8, size_average=True):
+        """
+        初始化多尺度梯度损失函数
+        
+        Args:
+            scales (int): 梯度计算的尺度数量，默认为4
+            alpha (float): 水平梯度权重，默认为1.0
+            beta (float): 垂直梯度权重，默认为1.0
+            epsilon (float): 数值稳定常数，防止除零错误，默认为1e-8
+            size_average (bool): 是否对损失值进行平均，默认为True
+        """
+        super(MultiScaleGradientLoss, self).__init__()
+        self.scales = scales
+        self.alpha = alpha
+        self.beta = beta
+        self.epsilon = epsilon
+        self.size_average = size_average
+        
+        # 创建高斯核用于多尺度平滑
+        self.gaussian_kernels = self._create_gaussian_kernels()
+    
+    def _create_gaussian_kernels(self):
+        """创建多尺度高斯核用于图像平滑"""
+        kernels = []
+        for i in range(self.scales):
+            # 不同尺度的高斯核大小
+            kernel_size = 5 + 2 * i
+            sigma = 1.0 + 0.5 * i
+            
+            # 创建1D高斯核
+            x = torch.arange(kernel_size, dtype=torch.float32) - (kernel_size - 1) / 2.0
+            gauss_1d = torch.exp(-x**2 / (2 * sigma**2))
+            gauss_1d = gauss_1d / gauss_1d.sum()
+            
+            # 创建2D高斯核
+            gauss_2d = gauss_1d.unsqueeze(1) * gauss_1d.unsqueeze(0)
+            gauss_2d = gauss_2d.unsqueeze(0).unsqueeze(0)
+            kernels.append(gauss_2d)
+        
+        return kernels
+    
+    def _compute_gradients(self, img):
+        """计算图像在水平和垂直方向的梯度"""
+        # Sobel算子用于梯度计算
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3)
+        
+        # 将算子移动到与图像相同的设备
+        sobel_x = sobel_x.to(img.device)
+        sobel_y = sobel_y.to(img.device)
+        
+        # 对每个通道分别计算梯度
+        channels = img.size(1)
+        grad_x_list = []
+        grad_y_list = []
+        
+        for i in range(channels):
+            # 提取单个通道
+            channel_img = img[:, i:i+1, :, :]
+            
+            # 计算该通道的梯度
+            grad_x_channel = F.conv2d(channel_img, sobel_x, padding=1)
+            grad_y_channel = F.conv2d(channel_img, sobel_y, padding=1)
+            
+            grad_x_list.append(grad_x_channel)
+            grad_y_list.append(grad_y_channel)
+        
+        # 合并所有通道的梯度
+        grad_x = torch.cat(grad_x_list, dim=1)
+        grad_y = torch.cat(grad_y_list, dim=1)
+        
+        return grad_x, grad_y
+    
+    def _smooth_image(self, img, kernel):
+        """使用高斯核对图像进行平滑"""
+        # 将高斯核移动到与图像相同的设备
+        kernel = kernel.to(img.device)
+        
+        # 对每个通道进行平滑
+        smoothed = F.conv2d(img, kernel.repeat(img.size(1), 1, 1, 1), 
+                           padding=kernel.size(-1)//2, groups=img.size(1))
+        return smoothed
+    
+    def _compute_scale_loss(self, pred, target, scale_idx):
+        """在特定尺度下计算梯度损失"""
+        # 对预测和目标图像进行平滑
+        kernel = self.gaussian_kernels[scale_idx]
+        pred_smooth = self._smooth_image(pred, kernel)
+        target_smooth = self._smooth_image(target, kernel)
+        
+        # 计算梯度
+        pred_grad_x, pred_grad_y = self._compute_gradients(pred_smooth)
+        target_grad_x, target_grad_y = self._compute_gradients(target_smooth)
+        
+        # 计算梯度差异
+        grad_diff_x = torch.abs(pred_grad_x - target_grad_x)
+        grad_diff_y = torch.abs(pred_grad_y - target_grad_y)
+        
+        # 计算方向感知损失
+        direction_loss = self.alpha * grad_diff_x + self.beta * grad_diff_y
+        
+        # 应用尺度权重（越精细的尺度权重越大）
+        scale_weight = 1.0 / (2 ** scale_idx)
+        
+        return direction_loss * scale_weight
+    
+    def forward(self, pred, target):
+        """
+        前向传播计算多尺度梯度损失
+        
+        Args:
+            pred (torch.Tensor): 预测图像，形状为[B, C, H, W]
+            target (torch.Tensor): 目标图像，形状为[B, C, H, W]
+            
+        Returns:
+            torch.Tensor: 多尺度梯度损失值
+        """
+        # 输入验证
+        assert pred.shape == target.shape, "预测和目标图像形状不匹配"
+        assert pred.dim() == 4, "输入应为4D张量 [B, C, H, W]"
+        
+        # 初始化总损失
+        total_loss = 0.0
+        
+        # 在每个尺度下计算损失
+        for scale_idx in range(self.scales):
+            scale_loss = self._compute_scale_loss(pred, target, scale_idx)
+            
+            # 数值稳定性处理
+            scale_loss = torch.clamp(scale_loss, min=self.epsilon)
+            
+            if self.size_average:
+                scale_loss = scale_loss.mean()
+            else:
+                scale_loss = scale_loss.sum()
+            
+            total_loss += scale_loss
+        
+        # 对总损失进行平均
+        if self.size_average:
+            total_loss = total_loss / self.scales
+        
+        return total_loss

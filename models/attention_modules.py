@@ -9,10 +9,13 @@ class ChannelAttention(nn.Module):
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.max_pool = nn.AdaptiveMaxPool2d(1)
         
+        # 确保压缩后的通道数至少为1
+        reduced_channels = max(1, in_channels // reduction)
+        
         self.fc = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels // reduction, 1, bias=False),
+            nn.Conv2d(in_channels, reduced_channels, 1, bias=False),
             nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels // reduction, in_channels, 1, bias=False)
+            nn.Conv2d(reduced_channels, in_channels, 1, bias=False)
         )
         self.sigmoid = nn.Sigmoid()
     

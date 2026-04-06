@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 @file name:DenseFuse.py
-@desc: DenseFuse网络模型优化 - 支持三种特征融合方案
+@desc: DenseFuse网络模型优化 - 支持两种CBAM注意力机制方案
 @Writer: Cat2eacher, wokaka209
 @Date: 2024/02/21
-@Update: 2026/04/01 - 添加三种融合方案支持
+@Update: 2026/04/05 - 添加两种CBAM注意力机制方案支持
 """
 import torch
 from torch import nn
@@ -12,6 +12,35 @@ try:
     from torchsummary import summary
 except ImportError:
     summary = None
+
+
+def create_cbam_attention(in_channels, reduction_ratio=16, kernel_size=7, use_color_aware=False, color_preservation_weight=0.3):
+    """
+    创建CBAM注意力模块 - 支持颜色感知CBAM
+    
+    Args:
+        in_channels: 输入通道数
+        reduction_ratio: 通道压缩比例，用于通道注意力
+        kernel_size: 空间注意力的卷积核大小
+        use_color_aware: 是否使用颜色感知CBAM（解决泛黄问题）
+        color_preservation_weight: 颜色保护权重（0.0-1.0）
+    """
+    try:
+        from .attention_modules import CBAM, ColorAwareCBAM
+    except ImportError:
+        from attention_modules import CBAM, ColorAwareCBAM
+    
+    if use_color_aware:
+        # 使用颜色感知CBAM，专门保护RGB图像中的颜色特征
+        return ColorAwareCBAM(
+            in_channels=in_channels, 
+            reduction=reduction_ratio, 
+            kernel_size=kernel_size,
+            color_preservation_weight=color_preservation_weight
+        )
+    else:
+        # 使用标准CBAM
+        return CBAM(in_channels=in_channels, reduction=reduction_ratio, kernel_size=kernel_size)
 
 
 # -------------------------#
@@ -47,24 +76,26 @@ class DenseConv2d(nn.Module):
 
 
 # -------------------------#
-#   Dense Block unit (支持方案1：内部注意力)
+#   Dense Block unit (支持方案1：DenseBlock输出后CBAM)
 # -------------------------#
 class DenseBlock(torch.nn.Module):
     """
-    DenseBlock模块
+    DenseBlock模块 - 支持两种CBAM注意力机制方案和颜色感知CBAM
     
     Args:
         in_channels: 输入通道数
         kernel_size: 卷积核大小
         stride: 步长
-        use_attention: 是否使用注意力机制（方案1和方案3启用）
-    
-    融合方案说明：
-        - 方案1：use_attention=True，在DenseBlock内部添加CBAM，实现实时引导融合
-        - 方案2：use_attention=False，不在DenseBlock内部添加注意力
-        - 方案3：use_attention=True，作为多层次注意力的一部分
+        cbam_scheme: CBAM实施方案选择
+            - 0: 不使用CBAM
+            - 1: 方案1 - DenseBlock输出后应用CBAM
+            - 2: 方案2 - 融合层输入前应用CBAM（需要外部处理）
+        reduction_ratio: 通道压缩比例（16, 32, 64, 128等）
+        use_color_aware: 是否使用颜色感知CBAM（解决泛黄问题）
+        color_preservation_weight: 颜色保护权重（0.0-1.0）
     """
-    def __init__(self, in_channels, kernel_size, stride, use_attention=False):
+    def __init__(self, in_channels, kernel_size, stride, cbam_scheme=0, reduction_ratio=16, 
+                 use_color_aware=False, color_preservation_weight=0.3):
         super().__init__()
         out_channels_def = 16
         denseblock = []
@@ -73,26 +104,37 @@ class DenseBlock(torch.nn.Module):
                        DenseConv2d(in_channels + out_channels_def * 2, out_channels_def, kernel_size, stride)]
         self.denseblock = nn.Sequential(*denseblock)
         
-        # 方案1和方案3：在DenseBlock内部添加注意力机制
-        self.use_attention = use_attention
-        if use_attention:
-            try:
-                from .attention_modules import ColorAwareCBAM
-            except ImportError:
-                from attention_modules import ColorAwareCBAM
-            # DenseBlock输出64通道，使用ColorAwareCBAM保护颜色特征
-            self.attention = ColorAwareCBAM(in_channels=64, reduction=None, kernel_size=7, color_preservation_weight=0.3)
+        # CBAM实施方案选择
+        self.cbam_scheme = cbam_scheme
+        
+        # 方案1：在DenseBlock输出后应用CBAM
+        if cbam_scheme == 1:
+            # DenseBlock输出64通道特征图
+            self.cbam_attention = create_cbam_attention(
+                in_channels=64, 
+                reduction_ratio=reduction_ratio, 
+                kernel_size=7,
+                use_color_aware=use_color_aware,
+                color_preservation_weight=color_preservation_weight
+            )
+            color_info = "颜色感知" if use_color_aware else "标准"
+            print(f"[方案1] 启用：DenseBlock输出后{color_info}CBAM (reduction_ratio={reduction_ratio})")
+        else:
+            self.cbam_attention = None
 
     def forward(self, x):
         out = self.denseblock(x)
-        if self.use_attention:
-            out = self.attention(out)
+        
+        # 方案1：在DenseBlock输出后应用CBAM
+        if self.cbam_scheme == 1 and self.cbam_attention is not None:
+            out = self.cbam_attention(out)
+        
         return out
 
 
 '''
 /****************************************************/
-    DenseFuse Network - 支持三种融合方案
+    DenseFuse Network - 支持两种融合方案
 /****************************************************/
 '''
 
@@ -100,97 +142,108 @@ class DenseBlock(torch.nn.Module):
 # ===================== Dense_Encoder =====================
 class Dense_Encoder(nn.Module):
     """
-    DenseFuse编码器
+    DenseFuse编码器 - 支持两种CBAM注意力机制方案和颜色感知CBAM
     
     Args:
         input_nc: 输入通道数
         kernel_size: 卷积核大小
         stride: 步长
-        fusion_strategy: 融合方案选择（1/2/3）
-            - 1: DenseBlock内部实时引导融合（推荐IVIF任务）
-            - 2: Decoder中解码特征选择（高质量融合需求）
-            - 3: 多层次组合全方位增强（最佳融合质量）
+        cbam_scheme: CBAM实施方案选择
+            - 0: 不使用CBAM
+            - 1: 方案1 - DenseBlock输出后应用CBAM
+            - 2: 方案2 - 融合层输入前应用CBAM
+        reduction_ratio: 通道压缩比例（16, 32, 64, 128等）
+        use_color_aware: 是否使用颜色感知CBAM（解决泛黄问题）
+        color_preservation_weight: 颜色保护权重（0.0-1.0）
     """
-    def __init__(self, input_nc=1, kernel_size=3, stride=1, fusion_strategy=1):
+    def __init__(self, input_nc=1, kernel_size=3, stride=1, cbam_scheme=0, reduction_ratio=16,
+                 use_color_aware=False, color_preservation_weight=0.3):
         super().__init__()
-        self.fusion_strategy = fusion_strategy
+        self.cbam_scheme = cbam_scheme
         
-        # 根据融合方案决定DenseBlock是否使用注意力
-        # 方案1和方案3：DenseBlock内部使用注意力
-        use_attention_in_denseblock = (fusion_strategy in [1, 3])
-        
+        # 基础卷积层
         self.conv = ConvLayer(input_nc, 16, kernel_size, stride)
-        self.DenseBlock = DenseBlock(16, kernel_size, stride, use_attention=use_attention_in_denseblock)
         
-        # 方案3：在Encoder末尾也添加注意力（多层次组合）
-        if fusion_strategy == 3:
-            try:
-                from .attention_modules import ColorAwareCBAM
-            except ImportError:
-                from attention_modules import ColorAwareCBAM
-            self.attention = ColorAwareCBAM(in_channels=64, reduction=None, kernel_size=7, color_preservation_weight=0.3)
+        # DenseBlock - 支持方案1和颜色感知CBAM
+        self.DenseBlock = DenseBlock(16, kernel_size, stride, cbam_scheme=cbam_scheme, 
+                                    reduction_ratio=reduction_ratio, use_color_aware=use_color_aware,
+                                    color_preservation_weight=color_preservation_weight)
+        
+        # 方案2：在融合层输入前应用CBAM（对两路输入分别处理）
+        if cbam_scheme == 2:
+            # 为红外和可见光特征分别创建CBAM
+            self.ir_cbam = create_cbam_attention(
+                in_channels=64, 
+                reduction_ratio=reduction_ratio, 
+                kernel_size=7,
+                use_color_aware=use_color_aware,
+                color_preservation_weight=color_preservation_weight
+            )
+            self.vi_cbam = create_cbam_attention(
+                in_channels=64, 
+                reduction_ratio=reduction_ratio, 
+                kernel_size=7,
+                use_color_aware=use_color_aware,
+                color_preservation_weight=color_preservation_weight
+            )
+            color_info = "颜色感知" if use_color_aware else "标准"
+            print(f"[方案2] 启用：融合层输入前{color_info}CBAM (reduction_ratio={reduction_ratio})")
         else:
-            self.attention = None
+            self.ir_cbam = None
+            self.vi_cbam = None
 
     def forward(self, x):
+        # 基础特征提取
         output = self.conv(x)
         output = self.DenseBlock(output)
         
-        # 方案3：Encoder末尾额外注意力增强
-        if self.fusion_strategy == 3 and self.attention is not None:
-            output = self.attention(output)
-        
+        # 方案2：在融合层输入前应用CBAM（需要外部提供两路输入）
+        # 这里只返回基础特征，方案2的具体实现在融合层中处理
         return output
+    
+    def forward_with_cbam_scheme2(self, ir_features, vi_features):
+        """
+        方案2专用前向传播：对两路输入分别应用CBAM
+        
+        Args:
+            ir_features: 红外特征图
+            vi_features: 可见光特征图
+            
+        Returns:
+            ir_attended: 经过CBAM处理的红外特征
+            vi_attended: 经过CBAM处理的可见光特征
+        """
+        if self.cbam_scheme == 2 and self.ir_cbam is not None and self.vi_cbam is not None:
+            ir_attended = self.ir_cbam(ir_features)
+            vi_attended = self.vi_cbam(vi_features)
+            return ir_attended, vi_attended
+        else:
+            return ir_features, vi_features
 
 
 # ====================== CNN_Decoder ======================
 class CNN_Decoder(nn.Module):
     """
-    DenseFuse解码器
+    DenseFuse解码器 - 简化实现，删除多余CBAM
     
     Args:
         output_nc: 输出通道数
         kernel_size: 卷积核大小
         stride: 步长
-        fusion_strategy: 融合方案选择（1/2/3）
-            - 1: DenseBlock内部实时引导融合（不在Decoder添加注意力）
-            - 2: Decoder中解码特征选择（在Decoder添加注意力）
-            - 3: 多层次组合全方位增强（在Decoder添加注意力）
     """
-    def __init__(self, output_nc=1, kernel_size=3, stride=1, fusion_strategy=1):
+    def __init__(self, output_nc=1, kernel_size=3, stride=1):
         super().__init__()
-        self.fusion_strategy = fusion_strategy
         
         # 解码器卷积层
         self.conv1 = ConvLayer(64, 64, kernel_size, stride)
         self.conv2 = ConvLayer(64, 32, kernel_size, stride)
         self.conv3 = ConvLayer(32, 16, kernel_size, stride)
         self.conv4 = ConvLayer(16, output_nc, kernel_size, stride, is_last=True)
-        
-        # 方案2和方案3：在解码过程中添加注意力机制
-        if fusion_strategy in [2, 3]:
-            try:
-                from .attention_modules import ColorAwareCBAM
-            except ImportError:
-                from attention_modules import ColorAwareCBAM
-            self.attention1 = ColorAwareCBAM(in_channels=64, reduction=None, kernel_size=7, color_preservation_weight=0.3)
-            self.attention2 = ColorAwareCBAM(in_channels=32, reduction=None, kernel_size=7, color_preservation_weight=0.3)
-        else:
-            self.attention1 = None
-            self.attention2 = None
 
     def forward(self, encoder_output):
-        # 第一层解码 + 注意力（方案2和方案3）
+        # 简化解码过程，删除多余CBAM
         x = self.conv1(encoder_output)
-        if self.fusion_strategy in [2, 3] and self.attention1 is not None:
-            x = self.attention1(x)
-        
-        # 第二层解码 + 注意力（方案2和方案3）
         x = self.conv2(x)
-        if self.fusion_strategy in [2, 3] and self.attention2 is not None:
-            x = self.attention2(x)
-        
-        # 后续解码层
         x = self.conv3(x)
         x = self.conv4(x)
         return x
@@ -199,77 +252,123 @@ class CNN_Decoder(nn.Module):
 # ====================== AutoEncoder ======================
 class DenseFuse_train(nn.Module):
     """
-    DenseFuse训练模型 - 支持三种融合方案
+    DenseFuse训练模型 - 支持两种CBAM注意力机制方案和颜色感知CBAM
     
     Args:
         input_nc: 输入通道数（1=灰度，3=RGB）
         output_nc: 输出通道数
         kernel_size: 卷积核大小
         stride: 步长
-        fusion_strategy: 融合方案选择（1/2/3）
-            - 方案1：DenseBlock内部实时引导融合
-              特点：在DenseBlock内部的特征融合过程中实现实时引导机制
-              优势：计算量略有增加，推荐用于IVIF（红外与可见光图像融合）任务
-              适用场景：红外与可见光图像融合，需要实时引导特征对齐
-            
-            - 方案2：Decoder中解码特征选择
-              特点：在Decoder模块的解码过程中实现特征选择功能
-              优势：会增加模型参数量，适用于高质量融合需求场景
-              适用场景：追求高质量融合结果，对细节保留要求高
-            
-            - 方案3：多层次组合全方位增强
-              特点：实现多层次组合的全方位特征增强机制
-              优势：计算开销最大，但能获得最佳融合质量
-              适用场景：追求最高融合质量，计算资源充足
+        cbam_scheme: CBAM实施方案选择
+            - 0: 不使用CBAM
+            - 1: 方案1 - DenseBlock输出后应用CBAM
+            - 2: 方案2 - 融合层输入前应用CBAM
+        reduction_ratio: 通道压缩比例（16, 32, 64, 128等）
+        use_color_aware: 是否使用颜色感知CBAM（解决泛黄问题）
+        color_preservation_weight: 颜色保护权重（0.0-1.0）
     
     Example:
-        >>> # 方案1：推荐用于IVIF任务
-        >>> model = DenseFuse_train(input_nc=1, output_nc=1, fusion_strategy=1)
+        >>> # 方案0：不使用CBAM
+        >>> model = DenseFuse_train(input_nc=1, output_nc=1, cbam_scheme=0)
         
-        >>> # 方案2：高质量融合需求
-        >>> model = DenseFuse_train(input_nc=1, output_nc=1, fusion_strategy=2)
+        >>> # 方案1：DenseBlock输出后CBAM
+        >>> model = DenseFuse_train(input_nc=1, output_nc=1, cbam_scheme=1, reduction_ratio=16)
         
-        >>> # 方案3：最佳融合质量
-        >>> model = DenseFuse_train(input_nc=1, output_nc=1, fusion_strategy=3)
+        >>> # 方案2：融合层输入前CBAM
+        >>> model = DenseFuse_train(input_nc=1, output_nc=1, cbam_scheme=2, reduction_ratio=32)
+        
+        >>> # 颜色感知CBAM（解决泛黄问题）
+        >>> model = DenseFuse_train(input_nc=3, output_nc=3, cbam_scheme=1, 
+        >>>                        use_color_aware=True, color_preservation_weight=0.3)
     """
-    def __init__(self, input_nc=1, output_nc=1, kernel_size=3, stride=1, fusion_strategy=1):
+    def __init__(self, input_nc=1, output_nc=1, kernel_size=3, stride=1, cbam_scheme=0, reduction_ratio=16,
+                 use_color_aware=False, color_preservation_weight=0.3):
         super().__init__()
         
-        # 验证融合方案参数
-        if fusion_strategy not in [1, 2, 3]:
-            raise ValueError(f"fusion_strategy must be 1, 2, or 3, got {fusion_strategy}")
+        # 验证CBAM方案参数
+        if cbam_scheme not in [0, 1, 2]:
+            raise ValueError(f"cbam_scheme must be 0, 1, or 2, got {cbam_scheme}")
         
-        self.fusion_strategy = fusion_strategy
+        self.cbam_scheme = cbam_scheme
+        self.reduction_ratio = reduction_ratio
+        self.use_color_aware = use_color_aware
+        self.color_preservation_weight = color_preservation_weight
         
-        # Encoder和Decoder使用相同的融合方案
+        # 创建编码器和解码器
         self.encoder = Dense_Encoder(
             input_nc=input_nc, 
             kernel_size=kernel_size, 
             stride=stride, 
-            fusion_strategy=fusion_strategy
+            cbam_scheme=cbam_scheme,
+            reduction_ratio=reduction_ratio,
+            use_color_aware=use_color_aware,
+            color_preservation_weight=color_preservation_weight
         )
         self.decoder = CNN_Decoder(
             output_nc=output_nc, 
             kernel_size=kernel_size, 
-            stride=stride, 
-            fusion_strategy=fusion_strategy
+            stride=stride
         )
         
-        # 打印融合方案信息
-        self._print_strategy_info()
+        # 打印CBAM方案信息
+        self._print_cbam_info()
 
-    def _print_strategy_info(self):
-        """打印当前融合方案信息"""
-        strategy_info = {
-            1: "方案1：DenseBlock内部实时引导融合（推荐IVIF任务）",
-            2: "方案2：Decoder中解码特征选择（高质量融合需求）",
-            3: "方案3：多层次组合全方位增强（最佳融合质量）"
+    def _print_cbam_info(self):
+        """打印当前CBAM方案信息"""
+        scheme_info = {
+            0: "不使用CBAM注意力机制",
+            1: "方案1：DenseBlock输出后应用CBAM",
+            2: "方案2：融合层输入前应用CBAM"
         }
-        print(f"使用融合方案：{strategy_info[self.fusion_strategy]}")
+        if self.cbam_scheme > 0:
+            color_info = "颜色感知" if self.use_color_aware else "标准"
+            if self.use_color_aware:
+                print(f"使用{color_info}CBAM方案：{scheme_info[self.cbam_scheme]} (reduction_ratio={self.reduction_ratio}, color_weight={self.color_preservation_weight})")
+            else:
+                print(f"使用{color_info}CBAM方案：{scheme_info[self.cbam_scheme]} (reduction_ratio={self.reduction_ratio})")
+        else:
+            print("不使用CBAM注意力机制")
 
     def forward(self, x):
+        """
+        单输入前向传播（适用于方案0和方案1）
+        
+        Args:
+            x: 输入图像
+            
+        Returns:
+            out: 融合结果
+        """
         encoder_feature = self.encoder(x)
         out = self.decoder(encoder_feature)
+        return out
+    
+    def forward_dual_input(self, ir_image, vi_image):
+        """
+        双输入前向传播（适用于方案2）
+        
+        Args:
+            ir_image: 红外图像
+            vi_image: 可见光图像
+            
+        Returns:
+            out: 融合结果
+        """
+        # 分别提取特征
+        ir_features = self.encoder(ir_image)
+        vi_features = self.encoder(vi_image)
+        
+        # 方案2：在融合层输入前应用CBAM
+        if self.cbam_scheme == 2:
+            ir_attended, vi_attended = self.encoder.forward_with_cbam_scheme2(ir_features, vi_features)
+            # 简单平均融合
+            fused_features = (ir_attended + vi_attended) / 2
+        else:
+            # 方案0和方案1：简单平均融合
+            fused_features = (ir_features + vi_features) / 2
+        
+        # 解码
+        out = self.decoder(fused_features)
         return out
 
 
