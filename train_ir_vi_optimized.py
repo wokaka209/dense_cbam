@@ -82,13 +82,13 @@ def parse_args():
     # 训练相关参数（优化版）
     parser.add_argument('--device', type=str, default=device_on(), help='训练设备')
     parser.add_argument('--batch_size', type=int, default=16, help='input batch size')
-    parser.add_argument('--num_epochs', type=int, default=50, help='number of epochs to train for（优化版：50）')
+    parser.add_argument('--num_epochs', type=int, default=25, help='number of epochs to train for（优化版：25）')
     parser.add_argument('--lr', type=float, default=2e-4, help='初始学习率（优化版：2e-4）')
     parser.add_argument('--resume_path', default='', type=str, help='导入已训练好的模型路径')
     parser.add_argument('--num_workers', type=int, default=4, help='载入数据集所调用的cpu线程数')
     
     # 优化参数
-    parser.add_argument('--cbam_scheme', type=int, default=1, choices=[0, 1, 2], 
+    parser.add_argument('--cbam_scheme', type=int, default=0, choices=[0, 1, 2], 
                         help='CBAM实施方案选择: 0=不使用CBAM, 1=DenseBlock输出后CBAM, 2=融合层输入前CBAM')
     parser.add_argument('--reduction_ratio', type=int, default=16, choices=[16, 32, 64, 128], 
                         help='CBAM通道压缩比例: 16, 32, 64, 128等')
@@ -98,7 +98,7 @@ def parse_args():
                         choices=[0.1, 0.2, 0.3, 0.4, 0.5],
                         help='颜色保护权重（0.0-1.0），推荐0.4')
     parser.add_argument('--use_mixed_precision', action='store_true', default=True, help='是否使用混合精度训练')
-    parser.add_argument('--warmup_epochs', type=int, default=5, help='学习率预热epoch数')
+    parser.add_argument('--warmup_epochs', type=int, default=2, help='学习率预热epoch数')
     
     # 多尺度梯度损失参数
     parser.add_argument('--use_multiscale_gradient', action='store_true', default=True, 

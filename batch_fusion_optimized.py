@@ -26,15 +26,15 @@ def parse_arguments():
                         default='E:/whx_Graduation project/baseline_project/dataset/vi', 
                         help='可见光图像目录')
     parser.add_argument('--output_dir', type=str, 
-                        default='data_result/batch_fusion_optimized_colorcbam1_55', 
+                        default='data_result/batch_fusion_optimized_colorcbam0_25', 
                         help='输出目录')
     parser.add_argument('--model_weights', type=str, 
-                        default='runs/train_04-05_23-52/checkpoints/best.pth', 
+                        default='runs/train_04-07_12-39/checkpoints/best.pth', 
                         help='模型权重路径')
     
     # CBAM参数
     parser.add_argument('--cbam_scheme', type=int, 
-                        default=1, 
+                        default=0, 
                         choices=[0, 1, 2],
                         help='CBAM实施方案选择: 0=不使用, 1=方案1, 2=方案2')
     parser.add_argument('--reduction_ratio', type=int, 
@@ -58,7 +58,7 @@ def parse_arguments():
     
     # 混合融合权重配置（仅对hybrid策略有效）
     parser.add_argument('--hybrid_weights_preset', type=str,
-                        default='quality',
+                        default='balanced',
                         choices=['balanced', 'quality', 'detail', 'speed', 'edge_enhanced', 'structure_preserve'],
                         help='混合融合权重预设: balanced=平衡(默认), quality=高质量, detail=细节增强, speed=快速处理, edge_enhanced=边缘增强, structure_preserve=结构保持')
     
