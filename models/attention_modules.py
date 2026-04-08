@@ -42,21 +42,29 @@ class SpatialAttention(nn.Module):
 
 
 class CBAM(nn.Module):
-    def __init__(self, in_channels, reduction=16, kernel_size=7):
+    def __init__(self, in_channels, reduction=16, kernel_size=7, use_channel_attention=True, use_spatial_attention=True):
         super(CBAM, self).__init__()
-        self.channel_attention = ChannelAttention(in_channels, reduction)
-        self.spatial_attention = SpatialAttention(kernel_size)
+        self.use_channel_attention = use_channel_attention
+        self.use_spatial_attention = use_spatial_attention
+        
+        if self.use_channel_attention:
+            self.channel_attention = ChannelAttention(in_channels, reduction)
+        if self.use_spatial_attention:
+            self.spatial_attention = SpatialAttention(kernel_size)
     
     def forward(self, x):
-        x = x * self.channel_attention(x)
-        x = x * self.spatial_attention(x)
+        if self.use_channel_attention:
+            x = x * self.channel_attention(x)
+        if self.use_spatial_attention:
+            x = x * self.spatial_attention(x)
         return x
 
 
 class ColorAwareCBAM(nn.Module):
     """颜色感知CBAM - 专门保护RGB图像中的颜色特征"""
     
-    def __init__(self, in_channels, reduction=None, kernel_size=7, color_preservation_weight=0.3):
+    def __init__(self, in_channels, reduction=None, kernel_size=7, color_preservation_weight=0.3,
+                 use_channel_attention=True, use_spatial_attention=True):
         super(ColorAwareCBAM, self).__init__()
         
         # 智能选择reduction参数：对于RGB图像使用更小的值
@@ -66,9 +74,14 @@ class ColorAwareCBAM(nn.Module):
             else:
                 reduction = 16  # 其他情况使用默认值
         
-        self.channel_attention = ChannelAttention(in_channels, reduction)
-        self.spatial_attention = SpatialAttention(kernel_size)
+        self.use_channel_attention = use_channel_attention
+        self.use_spatial_attention = use_spatial_attention
         self.color_preservation_weight = color_preservation_weight
+        
+        if self.use_channel_attention:
+            self.channel_attention = ChannelAttention(in_channels, reduction)
+        if self.use_spatial_attention:
+            self.spatial_attention = SpatialAttention(kernel_size)
         
         # 如果是RGB图像（3通道），添加颜色保护机制
         if in_channels == 3:
@@ -82,8 +95,14 @@ class ColorAwareCBAM(nn.Module):
     
     def forward(self, x):
         # 原始注意力计算
-        channel_attn = self.channel_attention(x)
-        spatial_attn = self.spatial_attention(x)
+        if self.use_channel_attention:
+            channel_attn = self.channel_attention(x)
+        else:
+            channel_attn = 1.0
+        if self.use_spatial_attention:
+            spatial_attn = self.spatial_attention(x)
+        else:
+            spatial_attn = 1.0
         
         # 应用注意力
         x_attended = x * channel_attn * spatial_attn

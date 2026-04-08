@@ -699,3 +699,165 @@ python test/test_batch_fusion_cbam.py
 
 
 
+
+## Ablation Study Configuration 消融实验配置
+
+本项目实现了完整的消融实验功能，支持对CBAM注意力机制、融合策略和损失函数进行模块化配置，便于研究者进行组件有效性分析。
+
+### 1. CBAM注意力机制消融实验
+
+通过独立控制通道注意力和空间注意力，可以分析CBAM各组件对模型性能的影响。
+
+#### 配置参数
+
+| 参数名 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| --use_channel_attention | ool | True | 是否启用通道注意力模块 |
+| --use_spatial_attention | ool | True | 是否启用空间注意力模块 |
+
+#### 实验组合示例
+
+`ash
+# 完整CBAM（通道+空间注意力）
+python train_ir_vi_optimized.py --use_channel_attention --use_spatial_attention
+
+# 仅通道注意力
+python train_ir_vi_optimized.py --use_channel_attention --no-use_spatial_attention
+
+# 仅空间注意力
+python train_ir_vi_optimized.py --no-use_channel_attention --use_spatial_attention
+
+# 无注意力机制（基线）
+python train_ir_vi_optimized.py --no-use_channel_attention --no-use_spatial_attention
+`
+
+#### 技术实现
+
+在模型代码中，CBAM模块已更新为支持独立控制：
+- 当use_channel_attention=False时，跳过通道注意力计算
+- 当use_spatial_attention=False时，跳过空间注意力计算
+- 两者均为False时，CBAM模块退化为恒等映射
+
+### 2. 融合策略消融实验
+
+支持三种不同的融合策略，可用于分析不同融合方法对融合质量的影响。
+
+#### 配置参数
+
+| 参数名 | 类型 | 默认值 | 可选值 | 说明 |
+|--------|------|--------|--------|------|
+| --fusion_strategy | str | dd | dd, l1norm, hybrid | 融合策略选择 |
+
+#### 策略说明
+
+1. **add（平均融合）**: (ir_features + vi_features) / 2
+   - 优点：计算简单，稳定性高
+   - 适用场景：基线对比
+
+2. **l1norm（L1范数加权融合）**: 基于特征L1范数的自适应加权融合
+   - 优点：自适应权重，突出重要特征
+   - 适用场景：需要特征选择的任务
+
+3. **hybrid（混合融合）**: 结合add和l1norm的优点
+   - 优点：平衡稳定性和特征选择性
+   - 适用场景：追求最佳融合质量
+
+#### 实验组合示例
+
+`ash
+# 使用平均融合（默认）
+python train_ir_vi_optimized.py --fusion_strategy add
+
+# 使用L1范数加权融合
+python train_ir_vi_optimized.py --fusion_strategy l1norm
+
+# 使用混合融合
+python train_ir_vi_optimized.py --fusion_strategy hybrid
+`
+
+### 3. 梯度方向损失消融实验
+
+通过控制梯度方向，可以分析水平梯度和垂直梯度对损失函数的影响。
+
+#### 配置参数
+
+| 参数名 | 类型 | 默认值 | 可选值 | 说明 |
+|--------|------|--------|--------|------|
+| --gradient_direction | str | idirectional | single, idirectional | 梯度方向选择 |
+
+#### 方向说明
+
+1. **single（单方向）**: 仅使用水平梯度（alpha=1.0, beta=0.0）
+   - 优点：计算量减半，适合边缘主要呈水平方向的图像
+   - 适用场景：分析水平梯度的重要性
+
+2. **bidirectional（双向）**: 使用水平和垂直梯度（默认alpha=1.0, beta=1.0）
+   - 优点：全面捕捉图像边缘信息
+   - 适用场景：标准配置，追求最佳性能
+
+#### 实验组合示例
+
+`ash
+# 使用双向梯度损失（默认）
+python train_ir_vi_optimized.py --gradient_direction bidirectional
+
+# 使用单方向梯度损失
+python train_ir_vi_optimized.py --gradient_direction single
+`
+
+### 4. 组合实验配置
+
+消融实验支持任意组合配置，便于进行多因素分析：
+
+`ash
+# 示例1：仅通道注意力 + L1范数融合 + 单方向梯度
+python train_ir_vi_optimized.py \
+  --use_channel_attention \
+  --no-use_spatial_attention \
+  --fusion_strategy l1norm \
+  --gradient_direction single
+
+# 示例2：完整CBAM + 混合融合 + 双向梯度
+python train_ir_vi_optimized.py \
+  --use_channel_attention \
+  --use_spatial_attention \
+  --fusion_strategy hybrid \
+  --gradient_direction bidirectional
+
+# 示例3：无注意力 + 平均融合 + 单方向梯度（最小配置）
+python train_ir_vi_optimized.py \
+  --no-use_channel_attention \
+  --no-use_spatial_attention \
+  --fusion_strategy add \
+  --gradient_direction single
+`
+
+### 5. 实验结果记录
+
+运行训练时，所有消融实验配置会在日志中明确显示：
+
+`
+==================优化版训练参数==================
+----------优化选项----------
+use_channel_attention: True
+use_spatial_attention: False
+fusion_strategy: l1norm
+----------多尺度梯度损失参数----------
+gradient_direction: single
+`
+
+### 6. 实验设计建议
+
+1. **控制变量法**: 每次只改变一个变量，保持其他配置不变
+2. **基线建立**: 首先运行默认配置作为基线
+3. **组合分析**: 分析不同组件间的交互效应
+4. **重复实验**: 每个配置运行3次取平均值，确保结果稳定性
+
+### 7. 代码实现位置
+
+- **CBAM消融**: models/attention_modules.py中的CBAM和ColorAwareCBAM类
+- **融合策略**: models/DenseFuse.py中的pply_fusion_strategy函数
+- **梯度方向**: 	rain_ir_vi_optimized.py中的梯度损失配置逻辑
+- **参数解析**: 	rain_ir_vi_optimized.py中的parse_args函数
+
+通过以上消融实验配置，研究者可以系统地分析各组件对模型性能的贡献，为模型优化提供数据支持。

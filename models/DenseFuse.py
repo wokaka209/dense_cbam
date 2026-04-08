@@ -14,9 +14,10 @@ except ImportError:
     summary = None
 
 
-def create_cbam_attention(in_channels, reduction_ratio=16, kernel_size=7, use_color_aware=False, color_preservation_weight=0.3):
+def create_cbam_attention(in_channels, reduction_ratio=16, kernel_size=7, use_color_aware=False, color_preservation_weight=0.3,
+                         use_channel_attention=True, use_spatial_attention=True):
     """
-    创建CBAM注意力模块 - 支持颜色感知CBAM
+    创建CBAM注意力模块 - 支持颜色感知CBAM和消融实验
     
     Args:
         in_channels: 输入通道数
@@ -24,6 +25,8 @@ def create_cbam_attention(in_channels, reduction_ratio=16, kernel_size=7, use_co
         kernel_size: 空间注意力的卷积核大小
         use_color_aware: 是否使用颜色感知CBAM（解决泛黄问题）
         color_preservation_weight: 颜色保护权重（0.0-1.0）
+        use_channel_attention: 是否启用通道注意力（消融实验用）
+        use_spatial_attention: 是否启用空间注意力（消融实验用）
     """
     try:
         from .attention_modules import CBAM, ColorAwareCBAM
@@ -36,11 +39,65 @@ def create_cbam_attention(in_channels, reduction_ratio=16, kernel_size=7, use_co
             in_channels=in_channels, 
             reduction=reduction_ratio, 
             kernel_size=kernel_size,
-            color_preservation_weight=color_preservation_weight
+            color_preservation_weight=color_preservation_weight,
+            use_channel_attention=use_channel_attention,
+            use_spatial_attention=use_spatial_attention
         )
     else:
         # 使用标准CBAM
-        return CBAM(in_channels=in_channels, reduction=reduction_ratio, kernel_size=kernel_size)
+        return CBAM(in_channels=in_channels, reduction=reduction_ratio, kernel_size=kernel_size,
+                   use_channel_attention=use_channel_attention, use_spatial_attention=use_spatial_attention)
+
+
+# -------------------------#
+#   融合策略函数
+# -------------------------#
+def apply_fusion_strategy(ir_features, vi_features, strategy='add'):
+    """
+    应用融合策略 - 支持三种融合策略（add、l1norm、hybrid）
+    
+    Args:
+        ir_features: 红外特征图 [B, C, H, W]
+        vi_features: 可见光特征图 [B, C, H, W]
+        strategy: 融合策略，可选 'add', 'l1norm', 'hybrid'
+        
+    Returns:
+        fused_features: 融合后的特征图
+    """
+    if strategy == 'add':
+        # 简单平均融合
+        return (ir_features + vi_features) / 2
+    
+    elif strategy == 'l1norm':
+        # 基于L1范数的加权融合
+        ir_abs = torch.abs(ir_features)
+        vi_abs = torch.abs(vi_features)
+        sum_abs = ir_abs + vi_abs + 1e-8  # 防止除零
+        weight_ir = ir_abs / sum_abs
+        weight_vi = vi_abs / sum_abs
+        return weight_ir * ir_features + weight_vi * vi_features
+    
+    elif strategy == 'hybrid':
+        # 混合策略：结合add和l1norm的优点
+        # 首先计算add融合
+        add_fused = (ir_features + vi_features) / 2
+        # 计算l1norm融合
+        ir_abs = torch.abs(ir_features)
+        vi_abs = torch.abs(vi_features)
+        sum_abs = ir_abs + vi_abs + 1e-8
+        weight_ir = ir_abs / sum_abs
+        weight_vi = vi_abs / sum_abs
+        l1norm_fused = weight_ir * ir_features + weight_vi * vi_features
+        # 自适应权重：根据特征激活度决定
+        ir_norm = torch.norm(ir_features, p=1, dim=(2,3), keepdim=True)
+        vi_norm = torch.norm(vi_features, p=1, dim=(2,3), keepdim=True)
+        total_norm = ir_norm + vi_norm + 1e-8
+        alpha = ir_norm / total_norm  # 红外特征权重
+        # 加权混合
+        return alpha * add_fused + (1 - alpha) * l1norm_fused
+    
+    else:
+        raise ValueError(f"未知融合策略: {strategy}，请选择 'add', 'l1norm', 或 'hybrid'")
 
 
 # -------------------------#
@@ -95,7 +152,8 @@ class DenseBlock(torch.nn.Module):
         color_preservation_weight: 颜色保护权重（0.0-1.0）
     """
     def __init__(self, in_channels, kernel_size, stride, cbam_scheme=0, reduction_ratio=16, 
-                 use_color_aware=False, color_preservation_weight=0.3):
+                 use_color_aware=False, color_preservation_weight=0.3,
+                 use_channel_attention=True, use_spatial_attention=True):
         super().__init__()
         out_channels_def = 16
         denseblock = []
@@ -115,10 +173,14 @@ class DenseBlock(torch.nn.Module):
                 reduction_ratio=reduction_ratio, 
                 kernel_size=7,
                 use_color_aware=use_color_aware,
-                color_preservation_weight=color_preservation_weight
+                color_preservation_weight=color_preservation_weight,
+                use_channel_attention=use_channel_attention,
+                use_spatial_attention=use_spatial_attention
             )
             color_info = "颜色感知" if use_color_aware else "标准"
-            print(f"[方案1] 启用：DenseBlock输出后{color_info}CBAM (reduction_ratio={reduction_ratio})")
+            channel_info = "通道注意力" if use_channel_attention else "无通道注意力"
+            spatial_info = "空间注意力" if use_spatial_attention else "无空间注意力"
+            print(f"[方案1] 启用：DenseBlock输出后{color_info}CBAM ({channel_info}, {spatial_info}, reduction_ratio={reduction_ratio})")
         else:
             self.cbam_attention = None
 
@@ -157,7 +219,8 @@ class Dense_Encoder(nn.Module):
         color_preservation_weight: 颜色保护权重（0.0-1.0）
     """
     def __init__(self, input_nc=1, kernel_size=3, stride=1, cbam_scheme=0, reduction_ratio=16,
-                 use_color_aware=False, color_preservation_weight=0.3):
+                 use_color_aware=False, color_preservation_weight=0.3,
+                 use_channel_attention=True, use_spatial_attention=True):
         super().__init__()
         self.cbam_scheme = cbam_scheme
         
@@ -167,7 +230,9 @@ class Dense_Encoder(nn.Module):
         # DenseBlock - 支持方案1和颜色感知CBAM
         self.DenseBlock = DenseBlock(16, kernel_size, stride, cbam_scheme=cbam_scheme, 
                                     reduction_ratio=reduction_ratio, use_color_aware=use_color_aware,
-                                    color_preservation_weight=color_preservation_weight)
+                                    color_preservation_weight=color_preservation_weight,
+                                    use_channel_attention=use_channel_attention,
+                                    use_spatial_attention=use_spatial_attention)
         
         # 方案2：在融合层输入前应用CBAM（对两路输入分别处理）
         if cbam_scheme == 2:
@@ -177,17 +242,23 @@ class Dense_Encoder(nn.Module):
                 reduction_ratio=reduction_ratio, 
                 kernel_size=7,
                 use_color_aware=use_color_aware,
-                color_preservation_weight=color_preservation_weight
+                color_preservation_weight=color_preservation_weight,
+                use_channel_attention=use_channel_attention,
+                use_spatial_attention=use_spatial_attention
             )
             self.vi_cbam = create_cbam_attention(
                 in_channels=64, 
                 reduction_ratio=reduction_ratio, 
                 kernel_size=7,
                 use_color_aware=use_color_aware,
-                color_preservation_weight=color_preservation_weight
+                color_preservation_weight=color_preservation_weight,
+                use_channel_attention=use_channel_attention,
+                use_spatial_attention=use_spatial_attention
             )
             color_info = "颜色感知" if use_color_aware else "标准"
-            print(f"[方案2] 启用：融合层输入前{color_info}CBAM (reduction_ratio={reduction_ratio})")
+            channel_info = "通道注意力" if use_channel_attention else "无通道注意力"
+            spatial_info = "空间注意力" if use_spatial_attention else "无空间注意力"
+            print(f"[方案2] 启用：融合层输入前{color_info}CBAM ({channel_info}, {spatial_info}, reduction_ratio={reduction_ratio})")
         else:
             self.ir_cbam = None
             self.vi_cbam = None
@@ -282,7 +353,8 @@ class DenseFuse_train(nn.Module):
         >>>                        use_color_aware=True, color_preservation_weight=0.3)
     """
     def __init__(self, input_nc=1, output_nc=1, kernel_size=3, stride=1, cbam_scheme=0, reduction_ratio=16,
-                 use_color_aware=False, color_preservation_weight=0.3):
+                 use_color_aware=False, color_preservation_weight=0.3,
+                 use_channel_attention=True, use_spatial_attention=True, fusion_strategy='add'):
         super().__init__()
         
         # 验证CBAM方案参数
@@ -293,6 +365,9 @@ class DenseFuse_train(nn.Module):
         self.reduction_ratio = reduction_ratio
         self.use_color_aware = use_color_aware
         self.color_preservation_weight = color_preservation_weight
+        self.use_channel_attention = use_channel_attention
+        self.use_spatial_attention = use_spatial_attention
+        self.fusion_strategy = fusion_strategy
         
         # 创建编码器和解码器
         self.encoder = Dense_Encoder(
@@ -302,7 +377,9 @@ class DenseFuse_train(nn.Module):
             cbam_scheme=cbam_scheme,
             reduction_ratio=reduction_ratio,
             use_color_aware=use_color_aware,
-            color_preservation_weight=color_preservation_weight
+            color_preservation_weight=color_preservation_weight,
+            use_channel_attention=use_channel_attention,
+            use_spatial_attention=use_spatial_attention
         )
         self.decoder = CNN_Decoder(
             output_nc=output_nc, 
@@ -322,10 +399,20 @@ class DenseFuse_train(nn.Module):
         }
         if self.cbam_scheme > 0:
             color_info = "颜色感知" if self.use_color_aware else "标准"
+            # 构建注意力配置信息
+            attention_config = []
+            if self.use_channel_attention:
+                attention_config.append("通道注意力")
+            if self.use_spatial_attention:
+                attention_config.append("空间注意力")
+            if not attention_config:
+                attention_config.append("无注意力")
+            attention_str = "+".join(attention_config)
+            
             if self.use_color_aware:
-                print(f"使用{color_info}CBAM方案：{scheme_info[self.cbam_scheme]} (reduction_ratio={self.reduction_ratio}, color_weight={self.color_preservation_weight})")
+                print(f"使用{color_info}CBAM方案：{scheme_info[self.cbam_scheme]} (reduction_ratio={self.reduction_ratio}, color_weight={self.color_preservation_weight}, 注意力配置={attention_str}, 融合策略={self.fusion_strategy})")
             else:
-                print(f"使用{color_info}CBAM方案：{scheme_info[self.cbam_scheme]} (reduction_ratio={self.reduction_ratio})")
+                print(f"使用{color_info}CBAM方案：{scheme_info[self.cbam_scheme]} (reduction_ratio={self.reduction_ratio}, 注意力配置={attention_str}, 融合策略={self.fusion_strategy})")
         else:
             print("不使用CBAM注意力机制")
 
@@ -361,11 +448,11 @@ class DenseFuse_train(nn.Module):
         # 方案2：在融合层输入前应用CBAM
         if self.cbam_scheme == 2:
             ir_attended, vi_attended = self.encoder.forward_with_cbam_scheme2(ir_features, vi_features)
-            # 简单平均融合
-            fused_features = (ir_attended + vi_attended) / 2
+            # 使用指定的融合策略
+            fused_features = apply_fusion_strategy(ir_attended, vi_attended, self.fusion_strategy)
         else:
-            # 方案0和方案1：简单平均融合
-            fused_features = (ir_features + vi_features) / 2
+            # 方案0和方案1：使用指定的融合策略
+            fused_features = apply_fusion_strategy(ir_features, vi_features, self.fusion_strategy)
         
         # 解码
         out = self.decoder(fused_features)

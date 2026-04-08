@@ -26,15 +26,15 @@ def parse_arguments():
                         default='E:/whx_Graduation project/baseline_project/dataset/vi', 
                         help='可见光图像目录')
     parser.add_argument('--output_dir', type=str, 
-                        default='data_result/batch_fusion_optimized_colorcbam0_25', 
+                        default='data_result/RGB_CBAM1_full_bidirectional_04-08_12-04', 
                         help='输出目录')
     parser.add_argument('--model_weights', type=str, 
-                        default='runs/train_04-07_12-39/checkpoints/best.pth', 
+                        default='runs/RGB_CBAM1_full_bidirectional_04-08_12-04/checkpoints/best.pth', 
                         help='模型权重路径')
     
     # CBAM参数
     parser.add_argument('--cbam_scheme', type=int, 
-                        default=0, 
+                        default=1, 
                         choices=[0, 1, 2],
                         help='CBAM实施方案选择: 0=不使用, 1=方案1, 2=方案2')
     parser.add_argument('--reduction_ratio', type=int, 
@@ -47,11 +47,11 @@ def parse_arguments():
     parser.add_argument('--color_preservation_weight', type=float, 
                         default=0.4, 
                         choices=[0.1, 0.2, 0.3, 0.4, 0.5],
-                        help='颜色保护权重（0.0-1.0），推荐0.3')
+                        help='颜色保护权重（0.0-1.0），推荐0.4')
     
     # 融合策略参数
     parser.add_argument('--fusion_strategy', type=str, 
-                        default='hybrid',
+                        default='mean',
                         choices=['mean', 'max', 'l1norm', 'adaptive_l1', 'gradient_based', 
                                 'enhanced_l1', 'multi_scale', 'gradient', 'hybrid'],
                         help='融合策略选择: mean=平均, max=最大值, l1norm=L1范数, adaptive_l1=自适应L1, gradient_based=基于梯度, enhanced_l1=增强L1, multi_scale=多尺度, gradient=梯度引导, hybrid=混合融合')
@@ -60,7 +60,7 @@ def parse_arguments():
     parser.add_argument('--hybrid_weights_preset', type=str,
                         default='balanced',
                         choices=['balanced', 'quality', 'detail', 'speed', 'edge_enhanced', 'structure_preserve'],
-                        help='混合融合权重预设: balanced=平衡(默认), quality=高质量, detail=细节增强, speed=快速处理, edge_enhanced=边缘增强, structure_preserve=结构保持')
+                        help='混合融合权重预设: balanced=平衡(默认), quality=高质量, detail=细节增强, speed=快速处理, edge_enhanced=边缘增强, structure_preserve=结构保持（仅在hybrid策略下有效）')
     
     # 其他参数
     parser.add_argument('--gray', action='store_true', 
@@ -91,19 +91,18 @@ class FusionConfig:
         # 基础参数
         'ir_dir': 'E:/whx_Graduation project/baseline_project/dataset/ir',
         'vi_dir': 'E:/whx_Graduation project/baseline_project/dataset/vi',
-        'output_dir': 'data_result/batch_fusion_optimized_colorcbam1_55',
-        'model_weights': 'runs/train_04-05_23-52/checkpoints/best.pth',
+        'output_dir': 'data_result/batch_fusion_optimized_rgb_no_cbam_add_bidirectional',
+        'model_weights': 'runs/RGB_noCBAM_add_bidirectional_04-08_11-44/checkpoints/best.pth',
         
         # CBAM参数
-        'cbam_scheme': 1,  # 0=不使用, 1=方案1, 2=方案2
-        'reduction_ratio': 16,  # CBAM通道压缩比例
+        'cbam_scheme': 0,  # 0=不使用, 1=方案1, 2=方案2（与命令行默认值一致）
+        'reduction_ratio': None,  # CBAM通道压缩比例（与命令行默认值一致）
         'use_color_aware': True,  # 是否使用颜色感知CBAM（解决泛黄问题）
         'color_preservation_weight': 0.4,  # 颜色保护权重（0.0-1.0）
         
         # 融合算法参数
-        'fusion_strategy': 'hybrid',  # 融合策略选择
-        'hybrid_weights_preset': 'balanced',  # 混合融合权重预设
-        'fusion_algorithm': 'hybrid',  # 融合算法选择（内部使用）
+        'fusion_strategy': 'mean',  # 融合策略选择（与命令行默认值一致）
+        'hybrid_weights_preset': 'balanced',  # 混合融合权重预设（与命令行默认值一致）
         'gray': False,  # 是否使用灰度模式
         'model_name': 'DenseFuse',
         'device': "cuda" if torch.cuda.is_available() else "cpu",
@@ -141,8 +140,6 @@ class FusionConfig:
             self.fusion_strategy = args.fusion_strategy
         if hasattr(args, 'hybrid_weights_preset') and args.hybrid_weights_preset:
             self.hybrid_weights_preset = args.hybrid_weights_preset
-        if hasattr(args, 'fusion_algorithm') and args.fusion_algorithm:
-            self.fusion_algorithm = args.fusion_algorithm
         if hasattr(args, 'cbam_scheme') and args.cbam_scheme is not None:
             self.cbam_scheme = args.cbam_scheme
         if hasattr(args, 'reduction_ratio') and args.reduction_ratio is not None:
@@ -511,7 +508,6 @@ def print_config_summary(config):
     print("\n[其他配置]")
     print(f"  灰度模式: {'启用' if config.gray else '禁用'}")
     print(f"  设备: {config.device}")
-    print(f"  融合算法: {config.fusion_algorithm}")
     print(f"  目标尺寸: {config.target_size}")
     
     print("="*60)

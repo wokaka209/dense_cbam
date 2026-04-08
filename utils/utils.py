@@ -66,21 +66,48 @@ def create_run_directory(args, base_dir='./runs'):
     current_time = datetime.datetime.now()
     time_str = current_time.strftime('%m-%d_%H-%M')
 
+    # 构建模型与策略标识符
+    # 颜色模式
+    tag = "Gray" if args.gray else "RGB"
+    
+    # CBAM方案
+    cbam_scheme_map = {0: "noCBAM", 1: "CBAM1", 2: "CBAM2"}
+    cbam_str = cbam_scheme_map.get(args.cbam_scheme, f"CBAM{args.cbam_scheme}")
+    
+    # 注意力配置
+    attention_config = ""
+    if args.cbam_scheme != 0:  # 仅当使用CBAM时显示注意力配置
+        if args.use_channel_attention and args.use_spatial_attention:
+            attention_config = "_full"
+        elif args.use_channel_attention:
+            attention_config = "_channel"
+        elif args.use_spatial_attention:
+            attention_config = "_spatial"
+        else:
+            attention_config = "_noAttn"
+    
+    # 梯度方向
+    gradient_dir = f"_{args.gradient_direction}"
+    
     # 构建此次运行的唯一标识符作为子目录名称
-    run_identifier = f"train_{time_str}"
+    run_identifier = f"{tag}_{cbam_str}{attention_config}{gradient_dir}_{time_str}"
     run_path = os.path.join(base_dir, run_identifier)
 
     # 定义并构建子目录路径
     # 子文件夹 logs 和 checkpoints
     checkpoints_path = os.path.join(run_path, "checkpoints")
-    tag = "Gray" if args.gray else "RGB"
-    logs_name = f"logs_{tag}_epoch={args.num_epochs}"
+    logs_name = f"logs_epoch={args.num_epochs}"
     logs_path = os.path.join(run_path, logs_name)
 
     # 创建所需的目录结构
     os.makedirs(run_path, exist_ok=True)
     os.makedirs(logs_path, exist_ok=True)
     os.makedirs(checkpoints_path, exist_ok=True)
+
+    # 打印配置信息
+    print(f"[目录命名] 运行目录: {run_identifier}")
+    print(f"[配置信息] 颜色模式: {tag}, CBAM方案: {cbam_str}, 注意力: {attention_config[1:] if attention_config else 'N/A'}")
+    print(f"[配置信息] 梯度方向: {args.gradient_direction}")
 
     # return run_path, log_path, checkpoints_path
     return run_path, checkpoints_path, logs_path

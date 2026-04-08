@@ -82,35 +82,43 @@ def parse_args():
     # 训练相关参数（优化版）
     parser.add_argument('--device', type=str, default=device_on(), help='训练设备')
     parser.add_argument('--batch_size', type=int, default=16, help='input batch size')
-    parser.add_argument('--num_epochs', type=int, default=25, help='number of epochs to train for（优化版：25）')
+    parser.add_argument('--num_epochs', type=int, default=3, help='number of epochs to train for（优化版：25）')
     parser.add_argument('--lr', type=float, default=2e-4, help='初始学习率（优化版：2e-4）')
     parser.add_argument('--resume_path', default='', type=str, help='导入已训练好的模型路径')
     parser.add_argument('--num_workers', type=int, default=4, help='载入数据集所调用的cpu线程数')
     
     # 优化参数
-    parser.add_argument('--cbam_scheme', type=int, default=0, choices=[0, 1, 2], 
+    parser.add_argument('--cbam_scheme', type=int, default=1, choices=[0, 1, 2], 
                         help='CBAM实施方案选择: 0=不使用CBAM, 1=DenseBlock输出后CBAM, 2=融合层输入前CBAM')
-    parser.add_argument('--reduction_ratio', type=int, default=16, choices=[16, 32, 64, 128], 
+    parser.add_argument('--reduction_ratio', type=int, default=None, choices=[16, 32, 64, 128], 
                         help='CBAM通道压缩比例: 16, 32, 64, 128等')
     parser.add_argument('--use_color_aware', action='store_true', default=True, 
                         help='是否使用颜色感知CBAM（解决泛黄问题）')
     parser.add_argument('--color_preservation_weight', type=float, default=0.4, 
                         choices=[0.1, 0.2, 0.3, 0.4, 0.5],
                         help='颜色保护权重（0.0-1.0），推荐0.4')
+    # CBAM消融实验参数（仅在CBAM方案不为0时有效）
+    parser.add_argument('--use_channel_attention', action='store_true', default=True,
+                        help='是否启用通道注意力（仅在CBAM方案不为0时有效）')
+    parser.add_argument('--use_spatial_attention', action='store_true', default=True,
+                        help='是否启用空间注意力（仅在CBAM方案不为0时有效）')
     parser.add_argument('--use_mixed_precision', action='store_true', default=True, help='是否使用混合精度训练')
     parser.add_argument('--warmup_epochs', type=int, default=2, help='学习率预热epoch数')
     
-    # 多尺度梯度损失参数
+    # 多尺度梯度损失参数（仅在启用多尺度梯度时有效）
     parser.add_argument('--use_multiscale_gradient', action='store_true', default=True, 
                         help='是否启用多尺度梯度损失函数')
     parser.add_argument('--gradient_scales', type=int, default=4, choices=[2, 3, 4, 5], 
-                        help='多尺度梯度计算的尺度数量')
+                        help='多尺度梯度计算的尺度数量（仅在启用多尺度梯度时有效）')
     parser.add_argument('--gradient_weight', type=float, default=1.5, 
-                        help='多尺度梯度损失的权重系数')
+                        help='多尺度梯度损失的权重系数（仅在启用多尺度梯度时有效）')
     parser.add_argument('--gradient_alpha', type=float, default=1.5, 
-                        help='水平梯度权重（方向感知参数）')
+                        help='水平梯度权重（方向感知参数，仅在启用多尺度梯度时有效）')
     parser.add_argument('--gradient_beta', type=float, default=1.0, 
-                        help='垂直梯度权重（方向感知参数）')
+                        help='垂直梯度权重（方向感知参数，仅在启用多尺度梯度时有效）')
+    # 梯度方向消融实验参数（仅在启用多尺度梯度时有效）
+    parser.add_argument('--gradient_direction', type=str, default='bidirectional', choices=['single', 'bidirectional'],
+                        help='梯度方向选择: single=单方向梯度损失, bidirectional=双向梯度损失（仅在启用多尺度梯度时有效）')
     
     # 打印输出
     parser.add_argument('--output', action='store_true', default=True, help="shows output")
@@ -146,6 +154,9 @@ def parse_args():
             print(f'  └─ 颜色保护权重: {args.color_preservation_weight}')
         print(f'use_mixed_precision: {args.use_mixed_precision}')
         print(f'warmup_epochs: {args.warmup_epochs}')
+        # CBAM消融实验参数
+        print(f'use_channel_attention: {args.use_channel_attention}')
+        print(f'use_spatial_attention: {args.use_spatial_attention}')
         
         print("----------多尺度梯度损失参数----------")
         print(f'use_multiscale_gradient: {args.use_multiscale_gradient}')
@@ -154,6 +165,7 @@ def parse_args():
             print(f'gradient_weight: {args.gradient_weight}')
             print(f'gradient_alpha: {args.gradient_alpha}')
             print(f'gradient_beta: {args.gradient_beta}')
+            print(f'gradient_direction: {args.gradient_direction}')
     return args
 
 
@@ -252,7 +264,9 @@ if __name__ == "__main__":
         cbam_scheme=args.cbam_scheme,
         reduction_ratio=args.reduction_ratio,
         use_color_aware=args.use_color_aware,
-        color_preservation_weight=args.color_preservation_weight
+        color_preservation_weight=args.color_preservation_weight,
+        use_channel_attention=args.use_channel_attention,
+        use_spatial_attention=args.use_spatial_attention
     )
     model_train.to(device)
     print(f'模型参数量: {sum(p.numel() for p in model_train.parameters()):,}')
@@ -278,10 +292,22 @@ if __name__ == "__main__":
     # 多尺度梯度损失函数
     if args.use_multiscale_gradient:
         from utils.util_loss import MultiScaleGradientLoss
+        # 根据梯度方向参数调整alpha和beta
+        gradient_alpha = args.gradient_alpha
+        gradient_beta = args.gradient_beta
+        if args.gradient_direction == 'single':
+            # 单方向梯度损失：只使用水平梯度
+            gradient_alpha = 1.0
+            gradient_beta = 0.0
+            print(f'[梯度方向] 单方向梯度损失 (alpha={gradient_alpha}, beta={gradient_beta})')
+        else:
+            # 双向梯度损失：使用默认的alpha和beta
+            print(f'[梯度方向] 双向梯度损失 (alpha={gradient_alpha}, beta={gradient_beta})')
+        
         gradient_loss = MultiScaleGradientLoss(
             scales=args.gradient_scales,
-            alpha=args.gradient_alpha,
-            beta=args.gradient_beta,
+            alpha=gradient_alpha,
+            beta=gradient_beta,
             size_average=True
         ).to(device)
         print(f'[启用] 多尺度梯度损失函数已启用 (scales={args.gradient_scales}, weight={args.gradient_weight})')
