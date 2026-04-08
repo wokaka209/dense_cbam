@@ -369,8 +369,8 @@ def main():
         save_interval=1000
     )
     
-    model_name = "dense_colorcbam0_25"
-    fus_root = "data_result/batch_fusion_optimized_colorcbam0_25"
+    model_name = "RGB_CBAM1_full_none_04-08"
+    fus_root = "data_result/RGB_CBAM1_full_none_04-08"
     vi_root = "E:/whx_Graduation project/baseline_project/dataset/vi"
     ir_root = "E:/whx_Graduation project/baseline_project/dataset/ir"
     output_root = os.path.abspath("./tools/metric calculation/iqa_results")

@@ -21,6 +21,10 @@ import torch
 import glob
 import shutil
 
+# 混合精度训练支持
+if torch.cuda.is_available():
+    from torch.cuda.amp import GradScaler, autocast
+
 
 def cleanup_old_checkpoints(checkpoint_dir, keep_best=True, keep_last=True):
     """
@@ -82,27 +86,27 @@ def parse_args():
     # 训练相关参数（优化版）
     parser.add_argument('--device', type=str, default=device_on(), help='训练设备')
     parser.add_argument('--batch_size', type=int, default=16, help='input batch size')
-    parser.add_argument('--num_epochs', type=int, default=3, help='number of epochs to train for（优化版：25）')
+    parser.add_argument('--num_epochs', type=int, default=35, help='number of epochs to train for（优化版：25）')
     parser.add_argument('--lr', type=float, default=2e-4, help='初始学习率（优化版：2e-4）')
     parser.add_argument('--resume_path', default='', type=str, help='导入已训练好的模型路径')
     parser.add_argument('--num_workers', type=int, default=4, help='载入数据集所调用的cpu线程数')
     
     # 优化参数
-    parser.add_argument('--cbam_scheme', type=int, default=1, choices=[0, 1, 2], 
+    parser.add_argument('--cbam_scheme', type=int, default=0, choices=[0, 1, 2], 
                         help='CBAM实施方案选择: 0=不使用CBAM, 1=DenseBlock输出后CBAM, 2=融合层输入前CBAM')
-    parser.add_argument('--reduction_ratio', type=int, default=None, choices=[16, 32, 64, 128], 
+    parser.add_argument('--reduction_ratio', type=int, default=2, choices=[2, 8, 16, 32, 64, 128], 
                         help='CBAM通道压缩比例: 16, 32, 64, 128等')
     parser.add_argument('--use_color_aware', action='store_true', default=True, 
                         help='是否使用颜色感知CBAM（解决泛黄问题）')
-    parser.add_argument('--color_preservation_weight', type=float, default=0.4, 
+    parser.add_argument('--color_preservation_weight', type=float, default=0.5, 
                         choices=[0.1, 0.2, 0.3, 0.4, 0.5],
-                        help='颜色保护权重（0.0-1.0），推荐0.4')
+                        help='颜色保护权重（0.0-1.0），推荐0.5')
     # CBAM消融实验参数（仅在CBAM方案不为0时有效）
     parser.add_argument('--use_channel_attention', action='store_true', default=True,
                         help='是否启用通道注意力（仅在CBAM方案不为0时有效）')
     parser.add_argument('--use_spatial_attention', action='store_true', default=True,
                         help='是否启用空间注意力（仅在CBAM方案不为0时有效）')
-    parser.add_argument('--use_mixed_precision', action='store_true', default=True, help='是否使用混合精度训练')
+    parser.add_argument('--use_mixed_precision', action='store_true', default=False, help='是否使用混合精度训练')
     parser.add_argument('--warmup_epochs', type=int, default=2, help='学习率预热epoch数')
     
     # 多尺度梯度损失参数（仅在启用多尺度梯度时有效）
@@ -117,7 +121,7 @@ def parse_args():
     parser.add_argument('--gradient_beta', type=float, default=1.0, 
                         help='垂直梯度权重（方向感知参数，仅在启用多尺度梯度时有效）')
     # 梯度方向消融实验参数（仅在启用多尺度梯度时有效）
-    parser.add_argument('--gradient_direction', type=str, default='bidirectional', choices=['single', 'bidirectional'],
+    parser.add_argument('--gradient_direction', type=str, default='bidirectional', choices=['single', 'bidirectional', 'none'],
                         help='梯度方向选择: single=单方向梯度损失, bidirectional=双向梯度损失（仅在启用多尺度梯度时有效）')
     
     # 打印输出
@@ -412,6 +416,18 @@ if __name__ == "__main__":
         print(f'剩余训练epoch数: {num_epochs - init_epoch}')
     else:
         print(f'【从头训练】将从epoch 1 训练到epoch {num_epochs}')
+    
+    # 混合精度训练初始化
+    if args.use_mixed_precision and torch.cuda.is_available():
+        scaler = GradScaler()
+        print(f'[启用] 混合精度训练已启用 (GradScaler)')
+    else:
+        scaler = None
+        if args.use_mixed_precision and not torch.cuda.is_available():
+            print('[警告] 混合精度训练需要CUDA设备，当前设备不支持，已禁用')
+        else:
+            print('✗ 混合精度训练已禁用')
+    
     print('='*60)
     
     for epoch in range(init_epoch, num_epochs):
@@ -455,24 +471,48 @@ if __name__ == "__main__":
             inputs = image_batch.to(device)
             labels = image_batch.data.clone().to(device)
             
-            # 前向传播
-            outputs = model_train(inputs)
-            
-            # 计算损失（使用自适应权重）
-            pixel_loss_value = criterion["mse_loss"](outputs, labels)
-            ssim_loss_value = 1 - criterion["ssim_loss"](outputs, labels, normalize=True)
-            
-            # 基础损失
-            loss = mse_weight * pixel_loss_value + ssim_weight * ssim_loss_value
-            
-            # 如果启用了多尺度梯度损失，添加梯度损失
-            if args.use_multiscale_gradient and "gradient_loss" in criterion:
-                gradient_loss_value = criterion["gradient_loss"](outputs, labels)
-                loss += criterion["gradient_weight"] * gradient_loss_value
-            
-            # 反向传播
-            loss.backward()
-            optimizer.step()
+            # 混合精度训练前向传播
+            if scaler is not None:
+                with autocast():
+                    # 前向传播
+                    outputs = model_train(inputs)
+                    
+                    # 计算损失（使用自适应权重）
+                    pixel_loss_value = criterion["mse_loss"](outputs, labels)
+                    ssim_loss_value = 1 - criterion["ssim_loss"](outputs, labels, normalize=True)
+                    
+                    # 基础损失
+                    loss = mse_weight * pixel_loss_value + ssim_weight * ssim_loss_value
+                    
+                    # 如果启用了多尺度梯度损失，添加梯度损失
+                    if args.use_multiscale_gradient and "gradient_loss" in criterion:
+                        gradient_loss_value = criterion["gradient_loss"](outputs, labels)
+                        loss += criterion["gradient_weight"] * gradient_loss_value
+                
+                # 混合精度反向传播
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # 普通精度训练
+                # 前向传播
+                outputs = model_train(inputs)
+                
+                # 计算损失（使用自适应权重）
+                pixel_loss_value = criterion["mse_loss"](outputs, labels)
+                ssim_loss_value = 1 - criterion["ssim_loss"](outputs, labels, normalize=True)
+                
+                # 基础损失
+                loss = mse_weight * pixel_loss_value + ssim_weight * ssim_loss_value
+                
+                # 如果启用了多尺度梯度损失，添加梯度损失
+                if args.use_multiscale_gradient and "gradient_loss" in criterion:
+                    gradient_loss_value = criterion["gradient_loss"](outputs, labels)
+                    loss += criterion["gradient_weight"] * gradient_loss_value
+                
+                # 反向传播
+                loss.backward()
+                optimizer.step()
             
             # 记录损失值
             train_epoch_loss["mse_loss"].append(pixel_loss_value.item())

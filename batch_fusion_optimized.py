@@ -26,10 +26,10 @@ def parse_arguments():
                         default='E:/whx_Graduation project/baseline_project/dataset/vi', 
                         help='可见光图像目录')
     parser.add_argument('--output_dir', type=str, 
-                        default='data_result/RGB_CBAM1_full_bidirectional_04-08_12-04', 
+                        default='data_result/RGB_CBAM1_full_none_04-08', 
                         help='输出目录')
     parser.add_argument('--model_weights', type=str, 
-                        default='runs/RGB_CBAM1_full_bidirectional_04-08_12-04/checkpoints/best.pth', 
+                        default='runs/RGB_CBAM1_full_none_04-08_16-49/checkpoints/best.pth', 
                         help='模型权重路径')
     
     # CBAM参数
@@ -38,14 +38,14 @@ def parse_arguments():
                         choices=[0, 1, 2],
                         help='CBAM实施方案选择: 0=不使用, 1=方案1, 2=方案2')
     parser.add_argument('--reduction_ratio', type=int, 
-                        default=16, 
-                        choices=[8, 16, 32, 64, 128, 256],
+                        default=2, 
+                        choices=[2,8, 16, 32, 64, 128, 256],
                         help='CBAM通道压缩比例')
     parser.add_argument('--use_color_aware', action='store_true', 
                         default=True,
                         help='是否使用颜色感知CBAM（解决泛黄问题）')
     parser.add_argument('--color_preservation_weight', type=float, 
-                        default=0.4, 
+                        default=0.5, 
                         choices=[0.1, 0.2, 0.3, 0.4, 0.5],
                         help='颜色保护权重（0.0-1.0），推荐0.4')
     
@@ -170,7 +170,7 @@ class FusionConfig:
         # 检查参数范围
         if self.cbam_scheme not in [0, 1, 2]:
             raise ValueError(f"CBAM方案参数无效: {self.cbam_scheme}")
-        if self.reduction_ratio not in [8, 16, 32, 64, 128, 256]:
+        if self.reduction_ratio not in [2, 8, 16, 32, 64, 128, 256]:
             raise ValueError(f"reduction_ratio参数无效: {self.reduction_ratio}")
         if not 0.1 <= self.color_preservation_weight <= 0.5:
             raise ValueError(f"颜色保护权重超出范围: {self.color_preservation_weight}")
