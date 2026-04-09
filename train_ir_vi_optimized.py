@@ -92,7 +92,7 @@ def parse_args():
     parser.add_argument('--num_workers', type=int, default=4, help='载入数据集所调用的cpu线程数')
     
     # 优化参数
-    parser.add_argument('--cbam_scheme', type=int, default=0, choices=[0, 1, 2], 
+    parser.add_argument('--cbam_scheme', type=int, default=1, choices=[0, 1, 2], 
                         help='CBAM实施方案选择: 0=不使用CBAM, 1=DenseBlock输出后CBAM, 2=融合层输入前CBAM')
     parser.add_argument('--reduction_ratio', type=int, default=2, choices=[2, 8, 16, 32, 64, 128], 
                         help='CBAM通道压缩比例: 16, 32, 64, 128等')
@@ -102,7 +102,7 @@ def parse_args():
                         choices=[0.1, 0.2, 0.3, 0.4, 0.5],
                         help='颜色保护权重（0.0-1.0），推荐0.5')
     # CBAM消融实验参数（仅在CBAM方案不为0时有效）
-    parser.add_argument('--use_channel_attention', action='store_true', default=True,
+    parser.add_argument('--use_channel_attention', action='store_true', default=False,
                         help='是否启用通道注意力（仅在CBAM方案不为0时有效）')
     parser.add_argument('--use_spatial_attention', action='store_true', default=True,
                         help='是否启用空间注意力（仅在CBAM方案不为0时有效）')

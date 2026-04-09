@@ -26,10 +26,10 @@ def parse_arguments():
                         default='E:/whx_Graduation project/baseline_project/dataset/vi', 
                         help='可见光图像目录')
     parser.add_argument('--output_dir', type=str, 
-                        default='data_result/RGB_CBAM1_full_none_04-08', 
+                        default='data_result/RGB_CBAM1_spatial_bidirectional_04-09_15-57', 
                         help='输出目录')
     parser.add_argument('--model_weights', type=str, 
-                        default='runs/RGB_CBAM1_full_none_04-08_16-49/checkpoints/best.pth', 
+                        default='runs/RGB_CBAM1_spatial_bidirectional_04-09_15-57/checkpoints/best.pth', 
                         help='模型权重路径')
     
     # CBAM参数
@@ -48,6 +48,12 @@ def parse_arguments():
                         default=0.5, 
                         choices=[0.1, 0.2, 0.3, 0.4, 0.5],
                         help='颜色保护权重（0.0-1.0），推荐0.4')
+    
+    # CBAM消融实验参数（仅在CBAM方案不为0时有效）
+    parser.add_argument('--use_channel_attention', action='store_true', default=False,
+                        help='是否启用通道注意力（仅在CBAM方案不为0时有效）')
+    parser.add_argument('--use_spatial_attention', action='store_true', default=True,
+                        help='是否启用空间注意力（仅在CBAM方案不为0时有效）')
     
     # 融合策略参数
     parser.add_argument('--fusion_strategy', type=str, 
@@ -100,6 +106,10 @@ class FusionConfig:
         'use_color_aware': True,  # 是否使用颜色感知CBAM（解决泛黄问题）
         'color_preservation_weight': 0.4,  # 颜色保护权重（0.0-1.0）
         
+        # CBAM消融实验参数（仅在CBAM方案不为0时有效）
+        'use_channel_attention': False,  # 是否启用通道注意力
+        'use_spatial_attention': True,  # 是否启用空间注意力
+        
         # 融合算法参数
         'fusion_strategy': 'mean',  # 融合策略选择（与命令行默认值一致）
         'hybrid_weights_preset': 'balanced',  # 混合融合权重预设（与命令行默认值一致）
@@ -148,6 +158,11 @@ class FusionConfig:
             self.use_color_aware = args.use_color_aware
         if hasattr(args, 'color_preservation_weight') and args.color_preservation_weight is not None:
             self.color_preservation_weight = args.color_preservation_weight
+        # CBAM消融实验参数
+        if hasattr(args, 'use_channel_attention') and args.use_channel_attention is not None:
+            self.use_channel_attention = args.use_channel_attention
+        if hasattr(args, 'use_spatial_attention') and args.use_spatial_attention is not None:
+            self.use_spatial_attention = args.use_spatial_attention
         if hasattr(args, 'gray') and args.gray is not None:
             self.gray = args.gray
     
@@ -189,6 +204,8 @@ class FusionConfig:
             f"  reduction_ratio: {self.reduction_ratio}",
             f"  颜色感知CBAM: {self.use_color_aware}",
             f"  颜色保护权重: {self.color_preservation_weight}",
+            f"  通道注意力: {self.use_channel_attention}",
+            f"  空间注意力: {self.use_spatial_attention}",
             f"  灰度模式: {self.gray}",
             f"  设备: {self.device}"
         ]
@@ -214,6 +231,9 @@ class BatchImageFusionOptimized:
         reduction_ratio = self.config.reduction_ratio
         use_color_aware = self.config.use_color_aware
         color_preservation_weight = self.config.color_preservation_weight
+        # CBAM消融实验参数
+        use_channel_attention = self.config.use_channel_attention
+        use_spatial_attention = self.config.use_spatial_attention
         
         if 'cbam_scheme' in checkpoint:
             cbam_scheme = checkpoint['cbam_scheme']
@@ -239,6 +259,19 @@ class BatchImageFusionOptimized:
         else:
             print(f'[默认] 权重文件未保存color_preservation_weight信息，使用配置值: {color_preservation_weight}')
         
+        # 读取CBAM消融实验参数
+        if 'use_channel_attention' in checkpoint:
+            use_channel_attention = checkpoint['use_channel_attention']
+            print(f'[读取] 从权重文件读取通道注意力: {use_channel_attention}')
+        else:
+            print(f'[默认] 权重文件未保存通道注意力信息，使用配置值: {use_channel_attention}')
+            
+        if 'use_spatial_attention' in checkpoint:
+            use_spatial_attention = checkpoint['use_spatial_attention']
+            print(f'[读取] 从权重文件读取空间注意力: {use_spatial_attention}')
+        else:
+            print(f'[默认] 权重文件未保存空间注意力信息，使用配置值: {use_spatial_attention}')
+        
         # 使用CBAM方案创建模型
         self.model = DenseFuse_train(
             input_nc=in_channel,
@@ -246,7 +279,9 @@ class BatchImageFusionOptimized:
             cbam_scheme=cbam_scheme,
             reduction_ratio=reduction_ratio,
             use_color_aware=use_color_aware,
-            color_preservation_weight=color_preservation_weight
+            color_preservation_weight=color_preservation_weight,
+            use_channel_attention=use_channel_attention,
+            use_spatial_attention=use_spatial_attention
         )
         self.model = self.model.to(self.config.device)
         
@@ -262,6 +297,10 @@ class BatchImageFusionOptimized:
             print('  [方案1] DenseBlock输出后应用CBAM')
         elif cbam_scheme == 2:
             print('  [方案2] 融合层输入前应用CBAM')
+        
+        # CBAM消融实验配置信息
+        if cbam_scheme > 0:
+            print(f'[消融实验] 通道注意力: {use_channel_attention}, 空间注意力: {use_spatial_attention}')
 
     def preprocess_image(self, image_path):
         image = read_image(image_path,
@@ -469,6 +508,27 @@ def print_config_summary(config):
         print(f"  颜色保护权重: {config.color_preservation_weight}")
     else:
         print("  [禁用] 颜色感知CBAM")
+    
+    # CBAM消融实验配置
+    print("\n[CBAM消融实验配置]")
+    if config.cbam_scheme > 0:
+        print(f"  通道注意力: {'启用' if config.use_channel_attention else '禁用'}")
+        print(f"  空间注意力: {'启用' if config.use_spatial_attention else '禁用'}")
+        
+        # 构建注意力配置描述
+        attention_components = []
+        if config.use_channel_attention:
+            attention_components.append("通道注意力")
+        if config.use_spatial_attention:
+            attention_components.append("空间注意力")
+        
+        if attention_components:
+            attention_str = " + ".join(attention_components)
+            print(f"  注意力配置: {attention_str}")
+        else:
+            print("  注意力配置: 无注意力（完全禁用）")
+    else:
+        print("  消融实验: 未启用（CBAM方案为0）")
     
     # 融合策略配置
     print("\n[融合策略配置]")

@@ -369,8 +369,8 @@ def main():
         save_interval=1000
     )
     
-    model_name = "RGB_CBAM1_full_none_04-08"
-    fus_root = "data_result/RGB_CBAM1_full_none_04-08"
+    model_name = "RGB_CBAM1_spatial_bidirectional_04-09_15-57"
+    fus_root = "data_result/RGB_CBAM1_spatial_bidirectional_04-09_15-57"
     vi_root = "E:/whx_Graduation project/baseline_project/dataset/vi"
     ir_root = "E:/whx_Graduation project/baseline_project/dataset/ir"
     output_root = os.path.abspath("./tools/metric calculation/iqa_results")
