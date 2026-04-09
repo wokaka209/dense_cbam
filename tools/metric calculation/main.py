@@ -370,7 +370,7 @@ def main():
     )
     
     model_name = "RGB_CBAM1_spatial_bidirectional_04-09_15-57"
-    fus_root = "data_result/RGB_CBAM1_spatial_bidirectional_04-09_15-57"
+    fus_root = "data_result/RGB_noCBAM_bidirectional_04-08_17-32"
     vi_root = "E:/whx_Graduation project/baseline_project/dataset/vi"
     ir_root = "E:/whx_Graduation project/baseline_project/dataset/ir"
     output_root = os.path.abspath("./tools/metric calculation/iqa_results")
